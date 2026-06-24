@@ -106,7 +106,7 @@ GitHub Actions remains a useful backup host. It runs from the included workflow 
 
 ## Vercel Pro
 
-The repo includes two Vercel Python functions:
+The repo includes a Vercel Python entrypoint at `api/index.py` with two routes:
 
 - `/api/check`: protected cron endpoint. It checks slots every minute on Vercel Pro production deployments.
 - `/api/telegram`: Telegram webhook endpoint. It answers `/status`, `/subscribe`, and `/unsubscribe` immediately.

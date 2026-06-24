@@ -1,7 +1,3 @@
 {
-  "crons": [{ "path": "/api/check", "schedule": "* * * * *" }],
-  "functions": {
-    "api/check.py": { "maxDuration": 60 },
-    "api/telegram.py": { "maxDuration": 60 }
-  }
+  "crons": [{ "path": "/api/check", "schedule": "* * * * *" }]
 }
