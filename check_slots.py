@@ -59,13 +59,17 @@ def env_int(name: str, default: int) -> int:
 
 
 def get_config() -> dict[str, Any]:
+    event_id = os.getenv("EVENT_ID", "20")
     return {
-        "event_id": os.getenv("EVENT_ID", "20"),
+        "event_id": event_id,
         "category_id": os.getenv("CATEGORY_ID", "12"),
         "months_ahead": env_int("MONTHS_AHEAD", 2),
         "event_label": os.getenv("EVENT_LABEL", "Short stay - Applicant"),
         "month_param": os.getenv("MONTH_PARAM", "date"),
         "state_file": Path(os.getenv("STATE_FILE", "state.json")),
+        "state_key": os.getenv("STATE_KEY", f"event-{event_id}"),
+        "supabase_url": os.getenv("SUPABASE_URL", "").rstrip("/"),
+        "supabase_service_key": os.getenv("SUPABASE_SERVICE_KEY", ""),
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
     }
@@ -90,7 +94,130 @@ def booking_url(event_id: str) -> str:
     return f"{BASE}?{urllib.parse.urlencode({'event': event_id})}"
 
 
-def read_state(path: Path) -> dict[str, Any]:
+def import_requests() -> Any:
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: install requests with `python -m pip install -r requirements.txt`") from exc
+    return requests
+
+
+def supabase_enabled(config: dict[str, Any]) -> bool:
+    return bool(config["supabase_url"] and config["supabase_service_key"])
+
+
+def supabase_headers(config: dict[str, Any]) -> dict[str, str]:
+    service_key = str(config["supabase_service_key"])
+    return {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def supabase_state_url(config: dict[str, Any]) -> str:
+    return f"{config['supabase_url']}/rest/v1/visa_slot_state"
+
+
+def telegram_state_key(config: dict[str, Any]) -> str:
+    return f"{config['state_key']}:telegram"
+
+
+def empty_state() -> dict[str, Any]:
+    return {
+        "open_dates": set(),
+        "telegram_update_offset": None,
+        "subscribed_chats": set(),
+    }
+
+
+def normalize_open_days(open_days: set[str] | dict[str, str]) -> dict[str, str]:
+    if isinstance(open_days, dict):
+        return {str(key): str(value) for key, value in open_days.items()}
+    return {str(date_key): "" for date_key in open_days}
+
+
+def read_supabase_value(config: dict[str, Any], key: str) -> Any:
+    requests = import_requests()
+    response = requests.get(
+        supabase_state_url(config),
+        headers=supabase_headers(config),
+        params={"key": f"eq.{key}", "select": "value"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return {}
+    return rows[0].get("value", {})
+
+
+def read_supabase_state(config: dict[str, Any]) -> dict[str, Any]:
+    state = empty_state()
+    open_days = read_supabase_value(config, str(config["state_key"]))
+    if isinstance(open_days, dict):
+        state["open_dates"] = {str(item) for item in open_days}
+    elif isinstance(open_days, list):
+        state["open_dates"] = {str(item) for item in open_days}
+
+    telegram_state = read_supabase_value(config, telegram_state_key(config))
+    if isinstance(telegram_state, dict):
+        raw_offset = telegram_state.get("telegram_update_offset")
+        if isinstance(raw_offset, int):
+            state["telegram_update_offset"] = raw_offset
+        raw_chats = telegram_state.get("subscribed_chats", [])
+        if isinstance(raw_chats, list):
+            state["subscribed_chats"] = {str(item) for item in raw_chats}
+    return state
+
+
+def upsert_supabase_value(config: dict[str, Any], key: str, value: dict[str, Any]) -> None:
+    requests = import_requests()
+    payload = {
+        "key": str(key),
+        "value": value,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    headers = supabase_headers(config)
+    headers["Prefer"] = "resolution=merge-duplicates"
+    response = requests.post(
+        supabase_state_url(config),
+        headers=headers,
+        params={"on_conflict": "key"},
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def save_supabase_state(
+    config: dict[str, Any],
+    open_days: set[str] | dict[str, str],
+    telegram_update_offset: int | None = None,
+    subscribed_chats: set[str] | None = None,
+) -> None:
+    upsert_supabase_value(config, str(config["state_key"]), normalize_open_days(open_days))
+    upsert_supabase_value(
+        config,
+        telegram_state_key(config),
+        {
+            "telegram_update_offset": telegram_update_offset,
+            "subscribed_chats": sorted(subscribed_chats or set()),
+        },
+    )
+
+
+def state_label(config: dict[str, Any]) -> str:
+    if supabase_enabled(config):
+        return f"supabase:{config['state_key']}"
+    return str(config["state_file"])
+
+
+def read_state(path: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or get_config()
+    if supabase_enabled(config):
+        return read_supabase_state(config)
+
     state: dict[str, Any] = {
         "open_dates": set(),
         "telegram_update_offset": None,
@@ -126,16 +253,23 @@ def read_state(path: Path) -> dict[str, Any]:
     return state
 
 
-def load_state(path: Path) -> set[str]:
-    return set(read_state(path)["open_dates"])
+def load_state(path: Path, config: dict[str, Any] | None = None) -> set[str]:
+    return set(read_state(path, config)["open_dates"])
 
 
 def save_state(
     path: Path,
-    open_dates: set[str],
+    open_days: set[str] | dict[str, str],
     telegram_update_offset: int | None = None,
     subscribed_chats: set[str] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
+    config = config or get_config()
+    if supabase_enabled(config):
+        save_supabase_state(config, open_days, telegram_update_offset, subscribed_chats)
+        return
+
+    open_dates = set(open_days) if isinstance(open_days, dict) else set(open_days)
     payload = {
         "open_dates": sorted(open_dates),
         "subscribed_chats": sorted(subscribed_chats or set()),
@@ -145,14 +279,6 @@ def save_state(
     if path.parent != Path("."):
         path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def import_requests() -> Any:
-    try:
-        import requests
-    except ImportError as exc:
-        raise RuntimeError("Missing dependency: install requests with `python -m pip install -r requirements.txt`") from exc
-    return requests
 
 
 def collapse_ws(text: str) -> str:
@@ -629,7 +755,7 @@ def cycle() -> dict[str, str]:
     config = get_config()
     current = run_once()
     current_dates = set(current)
-    state = read_state(config["state_file"])
+    state = read_state(config["state_file"], config)
     previous_dates = set(state["open_dates"])
     telegram_update_offset = state["telegram_update_offset"]
     subscribed_chats = set(state["subscribed_chats"])
@@ -670,11 +796,11 @@ def cycle() -> dict[str, str]:
                         send_errors.append(f"alert: {exc}")
                         print(f"[error] Telegram send failed: {exc}", file=sys.stderr)
     finally:
-        save_state(config["state_file"], current_dates, telegram_update_offset, subscribed_chats)
+        save_state(config["state_file"], current, telegram_update_offset, subscribed_chats, config)
 
     print(
         f"[summary] open={len(current_dates)} new={len(new_dates)} "
-        f"subscribers={len(subscribed_chats)} state={config['state_file']}",
+        f"subscribers={len(subscribed_chats)} state={state_label(config)}",
         flush=True,
     )
     if send_errors:

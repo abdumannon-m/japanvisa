@@ -70,8 +70,12 @@ MONTHS_AHEAD=2
 EVENT_LABEL=Short stay - Applicant
 MONTH_PARAM=date
 STATE_FILE=state.json
+STATE_KEY=event-20
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID= optional default alert target
+SUPABASE_URL=
+SUPABASE_SERVICE_KEY=
+CRON_SECRET= only for Vercel /api/check
 ```
 
 The default `EVENT_ID=20` is the UI tab used for the booking link and Referer header. The default `CATEGORY_ID=12` is the actual short-stay visa Applicant calendar category used by the AJAX endpoint. `MONTH_PARAM=date` is the discovered next-month request field and can be overridden if the embassy changes the endpoint.
@@ -98,9 +102,52 @@ as a `systemd` service. The monitor no longer needs Playwright or Chromium, so i
 
 GitHub Actions remains a useful backup host. It runs from the included workflow every 5 minutes, but GitHub cron can lag or skip under load, and command replies are only processed when a workflow run starts.
 
+## Vercel Pro
+
+The repo also includes a Vercel Python function at `/api/check` and `vercel.json` cron configuration for Vercel Pro. The cron runs every minute on production deployments and calls the same `cycle()` function as the CLI.
+
+The Vercel function is protected by `CRON_SECRET`: cron invocations include `Authorization: Bearer $CRON_SECRET`, and other requests are rejected when the secret is configured.
+
+Runbook:
+
+```bash
+# one-time
+npm i -g vercel
+vercel login
+vercel link                      # link repo to the Pro project
+
+# create the Supabase table (SQL editor):
+#   create table if not exists visa_slot_state (
+#     key text primary key,
+#     value jsonb not null default '{}'::jsonb,
+#     updated_at timestamptz not null default now()
+#   );
+#   alter table visa_slot_state enable row level security;   -- no policies = service-key only
+
+# secrets (run once each, paste value when prompted)
+vercel env add TELEGRAM_BOT_TOKEN production
+vercel env add TELEGRAM_CHAT_ID production
+vercel env add SUPABASE_URL production
+vercel env add SUPABASE_SERVICE_KEY production
+vercel env add CRON_SECRET production           # any long random string
+vercel env add CATEGORY_ID production            # 12
+vercel env add MONTHS_AHEAD production           # 2
+vercel env add EVENT_LABEL production            # Short stay - Applicant
+vercel env add MONTH_PARAM production            # date
+
+vercel deploy --prod             # cron only runs on production deployments
+```
+
+Notes:
+
+- Cron jobs run on production only.
+- Changing the schedule requires a redeploy because cadence lives in `vercel.json`.
+- The Supabase service role key bypasses RLS. Enable RLS on `visa_slot_state` and add no anon/public policies so only the server-side service key can access the table.
+- The existing GitHub Actions workflow can use the same Supabase environment variables and `STATE_KEY=event-20` as a backup watcher. It will dedupe against Vercel runs and avoid double alerts.
+
 ## State
 
-The monitor writes currently open dates, Telegram update offset, and subscribed chat ids to `state.json`. New alerts are sent only for dates that were not present in the previous state, so an open day does not repeat on later runs while it stays open. If a day closes and later reopens, it is alerted again.
+Without Supabase env vars, the monitor writes currently open dates, Telegram update offset, and subscribed chat ids to `state.json`. With `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`, it writes the current `{date: alt}` map to `visa_slot_state` under `STATE_KEY` and Telegram command metadata under a derived key. New alerts are sent only for dates that were not present in the previous state, so an open day does not repeat on later runs while it stays open. If a day closes and later reopens, it is alerted again.
 
 ## Limitations
 
