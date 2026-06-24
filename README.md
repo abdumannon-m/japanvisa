@@ -35,7 +35,7 @@ Anyone can open your Telegram bot and send:
 
 `/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in `state.json` so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
 
-On GitHub Actions, commands are answered when the workflow runs, so replies can take up to around 5 minutes. For faster replies, run the bot continuously on a VPS with `python check_slots.py --loop 60`.
+On GitHub Actions, commands are answered only when a workflow run starts. GitHub scheduled runs can be delayed or skipped, so this is not a true 24/7 bot runtime. For reliable minute-level checks, use Vercel Pro cron or run the bot continuously on a VPS with `python check_slots.py --loop 60`.
 
 ## Local Use
 
@@ -69,6 +69,7 @@ CATEGORY_ID=12
 MONTHS_AHEAD=2
 EVENT_LABEL=Short stay - Applicant
 MONTH_PARAM=date
+STATUS_INTERVAL_SECONDS=3600
 STATE_FILE=state.json
 STATE_KEY=event-20
 TELEGRAM_BOT_TOKEN=
@@ -104,7 +105,7 @@ GitHub Actions remains a useful backup host. It runs from the included workflow 
 
 ## Vercel Pro
 
-The repo also includes a Vercel Python function at `/api/check` and `vercel.json` cron configuration for Vercel Pro. The cron runs every minute on production deployments and calls the same `cycle()` function as the CLI.
+The repo also includes a Vercel Python function at `/api/check` and `vercel.json` cron configuration for Vercel Pro. The cron runs every minute on production deployments and calls the same `cycle()` function as the CLI. New slot alerts are sent immediately on the next cron tick; if nothing changes, a status message is sent after `STATUS_INTERVAL_SECONDS` seconds.
 
 The Vercel function is protected by `CRON_SECRET`: cron invocations include `Authorization: Bearer $CRON_SECRET`, and other requests are rejected when the secret is configured.
 
@@ -134,6 +135,7 @@ vercel env add CATEGORY_ID production            # 12
 vercel env add MONTHS_AHEAD production           # 2
 vercel env add EVENT_LABEL production            # Short stay - Applicant
 vercel env add MONTH_PARAM production            # date
+vercel env add STATUS_INTERVAL_SECONDS production # 3600
 
 vercel deploy --prod             # cron only runs on production deployments
 ```
@@ -147,7 +149,7 @@ Notes:
 
 ## State
 
-Without Supabase env vars, the monitor writes currently open dates, Telegram update offset, and subscribed chat ids to `state.json`. With `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`, it writes the current `{date: alt}` map to `visa_slot_state` under `STATE_KEY` and Telegram command metadata under a derived key. New alerts are sent only for dates that were not present in the previous state, so an open day does not repeat on later runs while it stays open. If a day closes and later reopens, it is alerted again.
+Without Supabase env vars, the monitor writes currently open dates, Telegram update offset, subscribed chat ids, and last status timestamp to `state.json`. With `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`, it writes the current `{date: alt}` map to `visa_slot_state` under `STATE_KEY` and Telegram command metadata under a derived key. New alerts are sent only for dates that were not present in the previous state, so an open day does not repeat on later runs while it stays open. If a day closes and later reopens, it is alerted again. If no new slot appears, a status message is sent after `STATUS_INTERVAL_SECONDS`.
 
 ## Limitations
 

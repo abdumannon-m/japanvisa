@@ -66,6 +66,7 @@ def get_config() -> dict[str, Any]:
         "months_ahead": env_int("MONTHS_AHEAD", 2),
         "event_label": os.getenv("EVENT_LABEL", "Short stay - Applicant"),
         "month_param": os.getenv("MONTH_PARAM", "date"),
+        "status_interval_seconds": env_int("STATUS_INTERVAL_SECONDS", 3600),
         "state_file": Path(os.getenv("STATE_FILE", "state.json")),
         "state_key": os.getenv("STATE_KEY", f"event-{event_id}"),
         "supabase_url": os.getenv("SUPABASE_URL", "").rstrip("/"),
@@ -128,6 +129,7 @@ def empty_state() -> dict[str, Any]:
         "open_dates": set(),
         "telegram_update_offset": None,
         "subscribed_chats": set(),
+        "last_status_at": None,
     }
 
 
@@ -168,6 +170,9 @@ def read_supabase_state(config: dict[str, Any]) -> dict[str, Any]:
         raw_chats = telegram_state.get("subscribed_chats", [])
         if isinstance(raw_chats, list):
             state["subscribed_chats"] = {str(item) for item in raw_chats}
+        raw_last_status_at = telegram_state.get("last_status_at")
+        if isinstance(raw_last_status_at, str):
+            state["last_status_at"] = raw_last_status_at
     return state
 
 
@@ -195,6 +200,7 @@ def save_supabase_state(
     open_days: set[str] | dict[str, str],
     telegram_update_offset: int | None = None,
     subscribed_chats: set[str] | None = None,
+    last_status_at: str | None = None,
 ) -> None:
     upsert_supabase_value(config, str(config["state_key"]), normalize_open_days(open_days))
     upsert_supabase_value(
@@ -203,6 +209,7 @@ def save_supabase_state(
         {
             "telegram_update_offset": telegram_update_offset,
             "subscribed_chats": sorted(subscribed_chats or set()),
+            "last_status_at": last_status_at,
         },
     )
 
@@ -218,11 +225,7 @@ def read_state(path: Path, config: dict[str, Any] | None = None) -> dict[str, An
     if supabase_enabled(config):
         return read_supabase_state(config)
 
-    state: dict[str, Any] = {
-        "open_dates": set(),
-        "telegram_update_offset": None,
-        "subscribed_chats": set(),
-    }
+    state = empty_state()
 
     if not path.exists():
         return state
@@ -250,6 +253,10 @@ def read_state(path: Path, config: dict[str, Any] | None = None) -> dict[str, An
     if isinstance(raw_chats, list):
         state["subscribed_chats"] = {str(item) for item in raw_chats}
 
+    raw_last_status_at = data.get("last_status_at")
+    if isinstance(raw_last_status_at, str):
+        state["last_status_at"] = raw_last_status_at
+
     return state
 
 
@@ -263,10 +270,11 @@ def save_state(
     telegram_update_offset: int | None = None,
     subscribed_chats: set[str] | None = None,
     config: dict[str, Any] | None = None,
+    last_status_at: str | None = None,
 ) -> None:
     config = config or get_config()
     if supabase_enabled(config):
-        save_supabase_state(config, open_days, telegram_update_offset, subscribed_chats)
+        save_supabase_state(config, open_days, telegram_update_offset, subscribed_chats, last_status_at)
         return
 
     open_dates = set(open_days) if isinstance(open_days, dict) else set(open_days)
@@ -274,6 +282,7 @@ def save_state(
         "open_dates": sorted(open_dates),
         "subscribed_chats": sorted(subscribed_chats or set()),
         "telegram_update_offset": telegram_update_offset,
+        "last_status_at": last_status_at,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     if path.parent != Path("."):
@@ -620,6 +629,43 @@ def build_help_message(current: dict[str, str], config: dict[str, Any]) -> str:
     )
 
 
+def parse_utc_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def should_send_status(last_status_at: str | None, interval_seconds: int, now: datetime) -> bool:
+    previous = parse_utc_timestamp(last_status_at)
+    if previous is None:
+        return True
+    return (now - previous).total_seconds() >= interval_seconds
+
+
+def send_to_alert_targets(message: str, config: dict[str, Any], alert_targets: set[str]) -> list[str]:
+    errors: list[str] = []
+    if not config["telegram_bot_token"] or not alert_targets:
+        try:
+            send_telegram(message, config)
+        except Exception as exc:
+            errors.append(str(exc))
+        return errors
+
+    for chat_id in sorted(alert_targets):
+        try:
+            send_telegram_to_chat(config["telegram_bot_token"], chat_id, message)
+        except Exception as exc:
+            errors.append(str(exc))
+    return errors
+
+
 def telegram_request(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
     data = urllib.parse.urlencode(
         params
@@ -759,7 +805,10 @@ def cycle() -> dict[str, str]:
     previous_dates = set(state["open_dates"])
     telegram_update_offset = state["telegram_update_offset"]
     subscribed_chats = set(state["subscribed_chats"])
+    last_status_at = state["last_status_at"]
     new_dates = sorted(current_dates - previous_dates)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
     send_errors: list[str] = []
 
     try:
@@ -786,21 +835,27 @@ def cycle() -> dict[str, str]:
 
         if new_dates:
             message = build_alert_message(new_dates, current, config)
-            if not config["telegram_bot_token"] or not alert_targets:
-                send_telegram(message, config)
+            alert_errors = send_to_alert_targets(message, config, alert_targets)
+            if alert_errors:
+                for error in alert_errors:
+                    send_errors.append(f"alert: {error}")
+                    print(f"[error] Telegram alert send failed: {error}", file=sys.stderr)
             else:
-                for chat_id in sorted(alert_targets):
-                    try:
-                        send_telegram_to_chat(config["telegram_bot_token"], chat_id, message)
-                    except Exception as exc:
-                        send_errors.append(f"alert: {exc}")
-                        print(f"[error] Telegram send failed: {exc}", file=sys.stderr)
+                last_status_at = now_iso
+        elif should_send_status(last_status_at, int(config["status_interval_seconds"]), now):
+            status_errors = send_to_alert_targets(build_status_message(current, config), config, alert_targets)
+            if status_errors:
+                for error in status_errors:
+                    send_errors.append(f"status: {error}")
+                    print(f"[error] Telegram status send failed: {error}", file=sys.stderr)
+            else:
+                last_status_at = now_iso
     finally:
-        save_state(config["state_file"], current, telegram_update_offset, subscribed_chats, config)
+        save_state(config["state_file"], current, telegram_update_offset, subscribed_chats, config, last_status_at)
 
     print(
         f"[summary] open={len(current_dates)} new={len(new_dates)} "
-        f"subscribers={len(subscribed_chats)} state={state_label(config)}",
+        f"subscribers={len(subscribed_chats)} status_at={last_status_at or 'never'} state={state_label(config)}",
         flush=True,
     )
     if send_errors:
