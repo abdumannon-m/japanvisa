@@ -123,7 +123,7 @@ npm i -g vercel
 vercel login
 vercel link                      # link repo to the Pro project
 
-# create the Supabase table (SQL editor):
+# create the Supabase table by running supabase/visa_slot_state.sql in the SQL editor:
 #   create table if not exists visa_slot_state (
 #     key text primary key,
 #     value jsonb not null default '{}'::jsonb,
@@ -131,26 +131,9 @@ vercel link                      # link repo to the Pro project
 #   );
 #   alter table visa_slot_state enable row level security;   -- no policies = service-key only
 
-# secrets (run once each, paste value when prompted)
-vercel env add TELEGRAM_BOT_TOKEN production
-vercel env add TELEGRAM_CHAT_ID production
-vercel env add TELEGRAM_WEBHOOK_SECRET production # any long random string
-vercel env add SUPABASE_URL production
-vercel env add SUPABASE_SERVICE_KEY production
-vercel env add CRON_SECRET production           # any long random string
-vercel env add CATEGORY_ID production            # 12
-vercel env add MONTHS_AHEAD production           # 2
-vercel env add EVENT_LABEL production            # Short stay - Applicant
-vercel env add MONTH_PARAM production            # date
-vercel env add STATUS_INTERVAL_SECONDS production # 3600
-
-vercel deploy --prod             # cron only runs on production deployments
-
-# after deploy, register Telegram webhook against the production URL
-export TELEGRAM_BOT_TOKEN="paste the bot token locally for this one command"
-export TELEGRAM_WEBHOOK_SECRET="paste the same webhook secret used in Vercel"
-python scripts/set_telegram_webhook.py https://your-production-domain.vercel.app
-unset TELEGRAM_BOT_TOKEN TELEGRAM_WEBHOOK_SECRET
+# prompts locally for Telegram/Supabase secrets, writes them to Vercel,
+# redeploys production, and registers the Telegram webhook
+python scripts/bootstrap_vercel_production.py --url https://japanvisa-nine.vercel.app
 ```
 
 Notes:
