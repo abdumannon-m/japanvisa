@@ -10,9 +10,11 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
@@ -79,27 +81,56 @@ def booking_url(event_id: str) -> str:
     return f"{BASE}?{urllib.parse.urlencode({'event': event_id})}"
 
 
-def load_state(path: Path) -> set[str]:
+def read_state(path: Path) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "open_dates": set(),
+        "telegram_update_offset": None,
+        "subscribed_chats": set(),
+    }
+
     if not path.exists():
-        return set()
+        return state
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         print(f"[warn] Could not read state file {path}: {exc}", file=sys.stderr)
-        return set()
+        return state
 
     if isinstance(data, list):
-        return {str(item) for item in data}
-    if isinstance(data, dict):
-        raw_dates = data.get("open_dates", [])
-        if isinstance(raw_dates, list):
-            return {str(item) for item in raw_dates}
-    return set()
+        state["open_dates"] = {str(item) for item in data}
+        return state
+    if not isinstance(data, dict):
+        return state
+
+    raw_dates = data.get("open_dates", [])
+    if isinstance(raw_dates, list):
+        state["open_dates"] = {str(item) for item in raw_dates}
+
+    raw_offset = data.get("telegram_update_offset")
+    if isinstance(raw_offset, int):
+        state["telegram_update_offset"] = raw_offset
+
+    raw_chats = data.get("subscribed_chats", [])
+    if isinstance(raw_chats, list):
+        state["subscribed_chats"] = {str(item) for item in raw_chats}
+
+    return state
 
 
-def save_state(path: Path, open_dates: set[str]) -> None:
+def load_state(path: Path) -> set[str]:
+    return set(read_state(path)["open_dates"])
+
+
+def save_state(
+    path: Path,
+    open_dates: set[str],
+    telegram_update_offset: int | None = None,
+    subscribed_chats: set[str] | None = None,
+) -> None:
     payload = {
         "open_dates": sorted(open_dates),
+        "subscribed_chats": sorted(subscribed_chats or set()),
+        "telegram_update_offset": telegram_update_offset,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     if path.parent != Path("."):
@@ -239,6 +270,79 @@ def build_message(date_key: str, alt: str, config: dict[str, Any]) -> str:
     )
 
 
+def build_status_message(current: dict[str, str], config: dict[str, Any]) -> str:
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    label = html.escape(str(config["event_label"]))
+    escaped_url = html.escape(booking_url(str(config["event_id"])), quote=True)
+    lines = [
+        "<b>Japan visa slot status</b>",
+        label,
+    ]
+    if current:
+        lines.append("")
+        lines.append("<b>Open dates</b>")
+        for date_key, alt in sorted(current.items()):
+            lines.append(f"- <b>{html.escape(date_key)}</b>: {html.escape(alt)}")
+    else:
+        lines.append("")
+        lines.append("No open dates found right now.")
+    lines.extend(
+        [
+            "",
+            f"Book: <a href=\"{escaped_url}\">reservation calendar</a>",
+            f"Checked: {timestamp} UTC",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_help_message(current: dict[str, str], config: dict[str, Any]) -> str:
+    return (
+        "Send /status to check current Japan visa slots.\n"
+        "Send /subscribe to receive newly opened slot alerts.\n"
+        "Send /unsubscribe to stop alerts.\n\n"
+        + build_status_message(current, config)
+    )
+
+
+def telegram_request(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
+    data = urllib.parse.urlencode(
+        params
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=data,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(body).get("description", body)
+        except json.JSONDecodeError:
+            detail = body or HTTPStatus(exc.code).phrase
+        raise RuntimeError(f"Telegram {method} failed: {detail}") from exc
+
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {payload.get('description', 'unknown error')}")
+    return payload
+
+
+def send_telegram_to_chat(token: str, chat_id: str, message: str) -> None:
+    telegram_request(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        },
+    )
+
+
 def send_telegram(message: str, config: dict[str, Any]) -> None:
     token = config["telegram_bot_token"]
     chat_id = config["telegram_chat_id"]
@@ -246,45 +350,127 @@ def send_telegram(message: str, config: dict[str, Any]) -> None:
         print("[dry-run] Telegram credentials missing; message would be:")
         print(message)
         return
+    send_telegram_to_chat(token, chat_id, message)
 
-    data = urllib.parse.urlencode(
-        {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data=data,
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        response.read()
+
+def get_telegram_updates(token: str, offset: int | None) -> list[dict[str, Any]]:
+    params = {
+        "timeout": "0",
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if offset is not None:
+        params["offset"] = str(offset)
+    payload = telegram_request(token, "getUpdates", params)
+    result = payload.get("result", [])
+    return result if isinstance(result, list) else []
+
+
+def command_from_text(text: str) -> str:
+    first = text.strip().split(maxsplit=1)[0].lower()
+    return first.split("@", maxsplit=1)[0]
+
+
+def process_telegram_commands(
+    current: dict[str, str],
+    config: dict[str, Any],
+    offset: int | None,
+    subscribed_chats: set[str],
+) -> tuple[int | None, set[str], list[str]]:
+    token = config["telegram_bot_token"]
+    if not token:
+        return offset, subscribed_chats, []
+
+    errors: list[str] = []
+    try:
+        updates = get_telegram_updates(token, offset)
+    except Exception as exc:
+        return offset, subscribed_chats, [str(exc)]
+
+    next_offset = offset
+    for update in updates:
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            next_offset = update_id + 1
+
+        message = update.get("message")
+        if not isinstance(message, dict):
+            continue
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or chat.get("id") is None:
+            continue
+        chat_id = str(chat["id"])
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        command = command_from_text(text)
+        reply: str | None = None
+        if command in {"/start", "/help"}:
+            reply = build_help_message(current, config)
+        elif command == "/status":
+            reply = build_status_message(current, config)
+        elif command == "/subscribe":
+            subscribed_chats.add(chat_id)
+            reply = "Subscribed. You will receive newly opened Japan visa slot alerts.\n\n"
+            reply += build_status_message(current, config)
+        elif command == "/unsubscribe":
+            subscribed_chats.discard(chat_id)
+            reply = "Unsubscribed. Send /subscribe any time to receive alerts again."
+        elif command.startswith("/"):
+            reply = "Supported commands: /status, /subscribe, /unsubscribe"
+
+        if reply:
+            try:
+                send_telegram_to_chat(token, chat_id, reply)
+            except Exception as exc:
+                errors.append(f"reply failed: {exc}")
+
+    return next_offset, subscribed_chats, errors
 
 
 def cycle() -> dict[str, str]:
     config = get_config()
     current = run_once()
     current_dates = set(current)
-    previous_dates = load_state(config["state_file"])
+    state = read_state(config["state_file"])
+    previous_dates = set(state["open_dates"])
+    telegram_update_offset = state["telegram_update_offset"]
+    subscribed_chats = set(state["subscribed_chats"])
     new_dates = sorted(current_dates - previous_dates)
     send_errors: list[str] = []
 
     try:
+        telegram_update_offset, subscribed_chats, command_errors = process_telegram_commands(
+            current,
+            config,
+            telegram_update_offset,
+            subscribed_chats,
+        )
+        for error in command_errors:
+            send_errors.append(error)
+            print(f"[error] Telegram command failed: {error}", file=sys.stderr)
+
+        alert_targets = set(subscribed_chats)
+        if config["telegram_chat_id"]:
+            alert_targets.add(str(config["telegram_chat_id"]))
+
         for date_key in new_dates:
-            try:
-                send_telegram(build_message(date_key, current[date_key], config), config)
-            except Exception as exc:
-                send_errors.append(f"{date_key}: {exc}")
-                print(f"[error] Telegram send failed for {date_key}: {exc}", file=sys.stderr)
+            message = build_message(date_key, current[date_key], config)
+            if not config["telegram_bot_token"] or not alert_targets:
+                send_telegram(message, config)
+                continue
+            for chat_id in sorted(alert_targets):
+                try:
+                    send_telegram_to_chat(config["telegram_bot_token"], chat_id, message)
+                except Exception as exc:
+                    send_errors.append(f"{date_key}: {exc}")
+                    print(f"[error] Telegram send failed for {date_key}: {exc}", file=sys.stderr)
     finally:
-        save_state(config["state_file"], current_dates)
+        save_state(config["state_file"], current_dates, telegram_update_offset, subscribed_chats)
 
     print(
         f"[summary] open={len(current_dates)} new={len(new_dates)} "
-        f"state={config['state_file']}",
+        f"subscribers={len(subscribed_chats)} state={config['state_file']}",
         flush=True,
     )
     if send_errors:
