@@ -2,3 +2,6 @@ state.json
 __pycache__/
 *.pyc
 .env
+.env.local
+.env.*.local
+.vercel
