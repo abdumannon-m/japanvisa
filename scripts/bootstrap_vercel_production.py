@@ -14,6 +14,7 @@ from set_telegram_webhook import set_webhook
 
 DEFAULT_SCOPE = "abdumannonmurodiy-3405s-projects"
 DEFAULT_URL = "https://japanvisa-nine.vercel.app"
+DEFAULT_REPO = "abdumannon-m/japanvisa"
 
 
 def require_url(value: str, label: str) -> str:
@@ -66,12 +67,28 @@ def deploy(scope: str) -> str | None:
     return None
 
 
+def set_github_secret(name: str, value: str, repo: str) -> None:
+    print(f"Setting GitHub secret {name}")
+    subprocess.run(
+        ["gh", "secret", "set", name, "--repo", repo],
+        input=value + "\n",
+        text=True,
+        check=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="One-shot production setup for the Japan visa Telegram monitor."
     )
     parser.add_argument("--scope", default=DEFAULT_SCOPE, help="Vercel scope/team slug")
     parser.add_argument("--url", default=DEFAULT_URL, help="Production Vercel URL to register with Telegram")
+    parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repository for backup workflow secrets")
+    parser.add_argument(
+        "--skip-github-secrets",
+        action="store_true",
+        help="Do not write TELEGRAM/SUPABASE secrets to GitHub Actions",
+    )
     args = parser.parse_args()
 
     production_url = require_url(args.url, "Production URL")
@@ -102,6 +119,18 @@ def main() -> int:
 
     for name, (value, sensitive) in values.items():
         set_env(name, value, args.scope, sensitive=sensitive)
+
+    if not args.skip_github_secrets:
+        github_secret_names = [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_WEBHOOK_SECRET",
+            "SUPABASE_URL",
+            "SUPABASE_SERVICE_KEY",
+        ]
+        if chat_id:
+            github_secret_names.append("TELEGRAM_CHAT_ID")
+        for name in github_secret_names:
+            set_github_secret(name, values[name][0], args.repo)
 
     deployed_url = deploy(args.scope) or production_url
     result = set_webhook(deployed_url, token, webhook_secret)

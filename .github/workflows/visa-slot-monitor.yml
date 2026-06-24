@@ -37,6 +37,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           STATE_KEY: "event-20"
@@ -44,4 +45,5 @@ jobs:
           CATEGORY_ID: "12"
           MONTHS_AHEAD: "2"
           EVENT_LABEL: "Short stay - Applicant"
+          STATUS_INTERVAL_SECONDS: "3600"
         run: python check_slots.py

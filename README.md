@@ -131,7 +131,7 @@ vercel link                      # link repo to the Pro project
 #   );
 #   alter table visa_slot_state enable row level security;   -- no policies = service-key only
 
-# prompts locally for Telegram/Supabase secrets, writes them to Vercel,
+# prompts locally for Telegram/Supabase secrets, writes them to Vercel and GitHub,
 # redeploys production, and registers the Telegram webhook
 python scripts/bootstrap_vercel_production.py --url https://japanvisa-nine.vercel.app
 ```
@@ -143,6 +143,7 @@ Notes:
 - When `TELEGRAM_WEBHOOK_SECRET` is set, cron skips `getUpdates`; command handling is done by `/api/telegram`.
 - The Supabase service role key bypasses RLS. Enable RLS on `visa_slot_state` and add no anon/public policies so only the server-side service key can access the table.
 - The existing GitHub Actions workflow can use the same Supabase environment variables and `STATE_KEY=event-20` as a backup watcher. It will dedupe against Vercel runs and avoid double alerts.
+- After webhook setup, GitHub Actions must also receive `TELEGRAM_WEBHOOK_SECRET`; otherwise `getUpdates` conflicts with the webhook. The bootstrap script handles this unless `--skip-github-secrets` is passed.
 
 ## State
 
