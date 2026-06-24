@@ -73,6 +73,7 @@ def get_config() -> dict[str, Any]:
         "supabase_service_key": os.getenv("SUPABASE_SERVICE_KEY", ""),
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+        "telegram_webhook_secret": os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
     }
 
 
@@ -666,6 +667,45 @@ def send_to_alert_targets(message: str, config: dict[str, Any], alert_targets: s
     return errors
 
 
+def handle_telegram_message(
+    message: dict[str, Any],
+    current: dict[str, str],
+    config: dict[str, Any],
+    subscribed_chats: set[str],
+) -> tuple[set[str], bool, bool, str | None]:
+    chat = message.get("chat")
+    if not isinstance(chat, dict) or chat.get("id") is None:
+        return subscribed_chats, False, False, None
+    chat_id = str(chat["id"])
+    text = message.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return subscribed_chats, False, False, None
+
+    command = command_from_text(text)
+    reply: str | None = None
+    if command in {"/start", "/help"}:
+        reply = build_help_message(current, config)
+    elif command == "/status":
+        reply = build_status_message(current, config)
+    elif command == "/subscribe":
+        subscribed_chats.add(chat_id)
+        reply = "Subscribed. You will receive newly opened Japan visa slot alerts.\n\n"
+        reply += build_status_message(current, config)
+    elif command == "/unsubscribe":
+        subscribed_chats.discard(chat_id)
+        reply = "Unsubscribed. Send /subscribe any time to receive alerts again."
+    elif command.startswith("/"):
+        reply = "Supported commands: /status, /subscribe, /unsubscribe"
+    else:
+        return subscribed_chats, False, False, None
+
+    try:
+        send_telegram_to_chat(config["telegram_bot_token"], chat_id, reply)
+    except Exception as exc:
+        return subscribed_chats, True, False, f"reply failed: {exc}"
+    return subscribed_chats, True, True, None
+
+
 def telegram_request(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
     data = urllib.parse.urlencode(
         params
@@ -743,7 +783,7 @@ def process_telegram_commands(
         "replies": 0,
     }
     token = config["telegram_bot_token"]
-    if not token:
+    if not token or config.get("telegram_webhook_secret"):
         return offset, subscribed_chats, [], stats
 
     errors: list[str] = []
@@ -760,41 +800,85 @@ def process_telegram_commands(
             next_offset = update_id + 1
 
         message = update.get("message")
-        if not isinstance(message, dict):
-            continue
-        chat = message.get("chat")
-        if not isinstance(chat, dict) or chat.get("id") is None:
-            continue
-        chat_id = str(chat["id"])
-        text = message.get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
-
-        command = command_from_text(text)
-        reply: str | None = None
-        if command in {"/start", "/help"}:
-            reply = build_help_message(current, config)
-        elif command == "/status":
-            reply = build_status_message(current, config)
-        elif command == "/subscribe":
-            subscribed_chats.add(chat_id)
-            reply = "Subscribed. You will receive newly opened Japan visa slot alerts.\n\n"
-            reply += build_status_message(current, config)
-        elif command == "/unsubscribe":
-            subscribed_chats.discard(chat_id)
-            reply = "Unsubscribed. Send /subscribe any time to receive alerts again."
-        elif command.startswith("/"):
-            reply = "Supported commands: /status, /subscribe, /unsubscribe"
-
-        if reply:
-            stats["commands"] += 1
-            try:
-                send_telegram_to_chat(token, chat_id, reply)
+        if isinstance(message, dict):
+            subscribed_chats, command_seen, reply_sent, error = handle_telegram_message(
+                message,
+                current,
+                config,
+                subscribed_chats,
+            )
+            if command_seen:
+                stats["commands"] += 1
+            if reply_sent:
                 stats["replies"] += 1
-            except Exception as exc:
-                errors.append(f"reply failed: {exc}")
+            if error:
+                errors.append(error)
 
     return next_offset, subscribed_chats, errors, stats
+
+
+def save_telegram_metadata(
+    path: Path,
+    config: dict[str, Any],
+    telegram_update_offset: int | None,
+    subscribed_chats: set[str],
+    last_status_at: str | None,
+) -> None:
+    if supabase_enabled(config):
+        upsert_supabase_value(
+            config,
+            telegram_state_key(config),
+            {
+                "telegram_update_offset": telegram_update_offset,
+                "subscribed_chats": sorted(subscribed_chats),
+                "last_status_at": last_status_at,
+            },
+        )
+        return
+
+    state = read_state(path, config)
+    save_state(
+        path,
+        set(state["open_dates"]),
+        telegram_update_offset,
+        subscribed_chats,
+        config,
+        last_status_at,
+    )
+
+
+def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
+    config = get_config()
+    if not config["telegram_bot_token"]:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required for Telegram webhook replies")
+
+    current = run_once()
+    state = read_state(config["state_file"], config)
+    subscribed_chats = set(state["subscribed_chats"])
+    message = update.get("message")
+    stats = {"commands": 0, "replies": 0}
+    if isinstance(message, dict):
+        subscribed_chats, command_seen, reply_sent, error = handle_telegram_message(
+            message,
+            current,
+            config,
+            subscribed_chats,
+        )
+        if command_seen:
+            stats["commands"] += 1
+        if reply_sent:
+            stats["replies"] += 1
+        if error:
+            raise RuntimeError(error)
+
+    save_telegram_metadata(
+        config["state_file"],
+        config,
+        state["telegram_update_offset"],
+        subscribed_chats,
+        state["last_status_at"],
+    )
+    return stats
 
 
 def cycle() -> dict[str, str]:

@@ -33,9 +33,9 @@ Anyone can open your Telegram bot and send:
 /unsubscribe
 ```
 
-`/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in `state.json` so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
+`/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in state so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
 
-On GitHub Actions, commands are answered only when a workflow run starts. GitHub scheduled runs can be delayed or skipped, so this is not a true 24/7 bot runtime. For reliable minute-level checks, use Vercel Pro cron or run the bot continuously on a VPS with `python check_slots.py --loop 60`.
+On Vercel, `/api/telegram` can receive Telegram webhooks so commands respond immediately. On GitHub Actions, commands are answered only when a workflow run starts. GitHub scheduled runs can be delayed or skipped, so this is not a true 24/7 bot runtime. For reliable minute-level checks, use Vercel Pro cron or run the bot continuously on a VPS with `python check_slots.py --loop 60`.
 
 ## Local Use
 
@@ -74,6 +74,7 @@ STATE_FILE=state.json
 STATE_KEY=event-20
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID= optional default alert target
+TELEGRAM_WEBHOOK_SECRET= optional webhook secret token
 SUPABASE_URL=
 SUPABASE_SERVICE_KEY=
 CRON_SECRET= only for Vercel /api/check
@@ -105,7 +106,12 @@ GitHub Actions remains a useful backup host. It runs from the included workflow 
 
 ## Vercel Pro
 
-The repo also includes a Vercel Python function at `/api/check` and `vercel.json` cron configuration for Vercel Pro. The cron runs every minute on production deployments and calls the same `cycle()` function as the CLI. New slot alerts are sent immediately on the next cron tick; if nothing changes, a status message is sent after `STATUS_INTERVAL_SECONDS` seconds.
+The repo includes two Vercel Python functions:
+
+- `/api/check`: protected cron endpoint. It checks slots every minute on Vercel Pro production deployments.
+- `/api/telegram`: Telegram webhook endpoint. It answers `/status`, `/subscribe`, and `/unsubscribe` immediately.
+
+New slot alerts are sent immediately on the next cron tick. If nothing changes, a status message is sent after `STATUS_INTERVAL_SECONDS` seconds.
 
 The Vercel function is protected by `CRON_SECRET`: cron invocations include `Authorization: Bearer $CRON_SECRET`, and other requests are rejected when the secret is configured.
 
@@ -128,6 +134,7 @@ vercel link                      # link repo to the Pro project
 # secrets (run once each, paste value when prompted)
 vercel env add TELEGRAM_BOT_TOKEN production
 vercel env add TELEGRAM_CHAT_ID production
+vercel env add TELEGRAM_WEBHOOK_SECRET production # any long random string
 vercel env add SUPABASE_URL production
 vercel env add SUPABASE_SERVICE_KEY production
 vercel env add CRON_SECRET production           # any long random string
@@ -138,12 +145,19 @@ vercel env add MONTH_PARAM production            # date
 vercel env add STATUS_INTERVAL_SECONDS production # 3600
 
 vercel deploy --prod             # cron only runs on production deployments
+
+# after deploy, register Telegram webhook against the production URL
+export TELEGRAM_BOT_TOKEN="paste the bot token locally for this one command"
+export TELEGRAM_WEBHOOK_SECRET="paste the same webhook secret used in Vercel"
+python scripts/set_telegram_webhook.py https://your-production-domain.vercel.app
+unset TELEGRAM_BOT_TOKEN TELEGRAM_WEBHOOK_SECRET
 ```
 
 Notes:
 
 - Cron jobs run on production only.
 - Changing the schedule requires a redeploy because cadence lives in `vercel.json`.
+- When `TELEGRAM_WEBHOOK_SECRET` is set, cron skips `getUpdates`; command handling is done by `/api/telegram`.
 - The Supabase service role key bypasses RLS. Enable RLS on `visa_slot_state` and add no anon/public policies so only the server-side service key can access the table.
 - The existing GitHub Actions workflow can use the same Supabase environment variables and `STATE_KEY=event-20` as a backup watcher. It will dedupe against Vercel runs and avoid double alerts.
 
