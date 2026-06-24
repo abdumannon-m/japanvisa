@@ -1,17 +1,17 @@
 # Japan Visa Slot Monitor
 
-Telegram monitor for the Embassy of Japan in Uzbekistan reservation calendar. It watches the short-stay visa Applicant calendar, answers public `/status` requests, and sends subscribed users a message when a newly opened appointment day appears.
+Telegram monitor for the Embassy of Japan in Uzbekistan reservation calendar. It watches the short-stay visa Applicant calendar through the embassy AJAX endpoint, answers public `/status` requests, and sends subscribed users a message when a newly opened appointment day appears.
 
 ## Setup
 
 1. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and copy the bot token.
-2. Send a message to the bot, then get your chat id from:
+2. Optional: if you want a fixed default alert target, send a message to the bot, then get your chat id from:
 
    ```text
    https://api.telegram.org/bot<token>/getUpdates
    ```
 
-   Use `result[].message.chat.id`.
+   Use `result[].message.chat.id` as `TELEGRAM_CHAT_ID`.
 3. Make this repository public. Public repositories have unlimited free GitHub Actions minutes; a 5-minute cron can exceed the private repository free tier.
 4. Add repository secrets in GitHub under **Settings -> Secrets and variables -> Actions -> Secrets -> Repository secrets**. Use **New repository secret**, not environment secrets and not variables:
 
@@ -39,11 +39,10 @@ On GitHub Actions, commands are answered when the workflow runs, so replies can 
 
 ## Local Use
 
-Install dependencies and the browser:
+Install dependencies:
 
 ```sh
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 ```
 
 Run one check:
@@ -66,14 +65,38 @@ Environment variables:
 
 ```text
 EVENT_ID=20
+CATEGORY_ID=12
 MONTHS_AHEAD=2
 EVENT_LABEL=Short stay - Applicant
+MONTH_PARAM=date
 STATE_FILE=state.json
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID= optional default alert target
 ```
 
-The default `EVENT_ID=20` is short-stay visa Applicant.
+The default `EVENT_ID=20` is the UI tab used for the booking link and Referer header. The default `CATEGORY_ID=12` is the actual short-stay visa Applicant calendar category used by the AJAX endpoint. `MONTH_PARAM=date` is the discovered next-month request field and can be overridden if the embassy changes the endpoint.
+
+## Probe Mode
+
+Use probe mode to verify the plain-HTTP session, CSRF cookie, AJAX response, and month-navigation parameter:
+
+```sh
+python check_slots.py --probe
+```
+
+It prints the seeded cookie status, the raw AJAX response, parsed month/icon counts, and candidate month parameter results.
+
+## Infrastructure
+
+Recommended always-on host: **GCP free-tier e2-micro** in `us-west1`, `us-central1`, or `us-east1`, running:
+
+```sh
+python check_slots.py --loop 60
+```
+
+as a `systemd` service. The monitor no longer needs Playwright or Chromium, so it has a small Python/requests footprint and is suitable for a free-tier VM.
+
+GitHub Actions remains a useful backup host. It runs from the included workflow every 5 minutes, but GitHub cron can lag or skip under load, and command replies are only processed when a workflow run starts.
 
 ## State
 
@@ -81,4 +104,4 @@ The monitor writes currently open dates, Telegram update offset, and subscribed 
 
 ## Limitations
 
-GitHub cron has roughly 5-minute granularity and can lag or skip under load. For second-level speed, run `python check_slots.py --loop 60` on a VPS or Raspberry Pi. Scheduled workflows can pause after 60 days of repository inactivity.
+GitHub cron has roughly 5-minute granularity and can lag or skip under load. For second-level speed, run `python check_slots.py --loop 60` on a VPS. Scheduled workflows can pause after 60 days of repository inactivity.

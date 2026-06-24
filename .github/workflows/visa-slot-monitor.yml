@@ -31,15 +31,14 @@ jobs:
           restore-keys: visa-state-
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EVENT_ID: "20"
+          CATEGORY_ID: "12"
           MONTHS_AHEAD: "2"
           EVENT_LABEL: "Short stay - Applicant"
         run: python check_slots.py
