@@ -375,17 +375,23 @@ def process_telegram_commands(
     config: dict[str, Any],
     offset: int | None,
     subscribed_chats: set[str],
-) -> tuple[int | None, set[str], list[str]]:
+) -> tuple[int | None, set[str], list[str], dict[str, int]]:
+    stats = {
+        "updates": 0,
+        "commands": 0,
+        "replies": 0,
+    }
     token = config["telegram_bot_token"]
     if not token:
-        return offset, subscribed_chats, []
+        return offset, subscribed_chats, [], stats
 
     errors: list[str] = []
     try:
         updates = get_telegram_updates(token, offset)
     except Exception as exc:
-        return offset, subscribed_chats, [str(exc)]
+        return offset, subscribed_chats, [str(exc)], stats
 
+    stats["updates"] = len(updates)
     next_offset = offset
     for update in updates:
         update_id = update.get("update_id")
@@ -420,12 +426,14 @@ def process_telegram_commands(
             reply = "Supported commands: /status, /subscribe, /unsubscribe"
 
         if reply:
+            stats["commands"] += 1
             try:
                 send_telegram_to_chat(token, chat_id, reply)
+                stats["replies"] += 1
             except Exception as exc:
                 errors.append(f"reply failed: {exc}")
 
-    return next_offset, subscribed_chats, errors
+    return next_offset, subscribed_chats, errors, stats
 
 
 def cycle() -> dict[str, str]:
@@ -440,11 +448,18 @@ def cycle() -> dict[str, str]:
     send_errors: list[str] = []
 
     try:
-        telegram_update_offset, subscribed_chats, command_errors = process_telegram_commands(
+        telegram_update_offset, subscribed_chats, command_errors, command_stats = process_telegram_commands(
             current,
             config,
             telegram_update_offset,
             subscribed_chats,
+        )
+        print(
+            "[telegram] "
+            f"updates={command_stats['updates']} "
+            f"commands={command_stats['commands']} "
+            f"replies={command_stats['replies']}",
+            flush=True,
         )
         for error in command_errors:
             send_errors.append(error)
