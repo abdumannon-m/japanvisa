@@ -110,6 +110,7 @@ The repo includes a Vercel Python entrypoint at `api/index.py` with two routes:
 
 - `/api/check`: protected cron endpoint. It checks slots every minute on Vercel Pro production deployments.
 - `/api/telegram`: Telegram webhook endpoint. It answers `/status`, `/subscribe`, and `/unsubscribe` immediately.
+- `/api/health`: non-secret deployment health endpoint. It reports whether Telegram, Supabase, webhook, and cron secrets are configured.
 
 New slot alerts are sent immediately on the next cron tick. If nothing changes, a status message is sent after `STATUS_INTERVAL_SECONDS` seconds.
 

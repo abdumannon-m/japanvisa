@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from check_slots import cycle, handle_telegram_webhook_update
+from check_slots import cycle, get_config, handle_telegram_webhook_update, supabase_enabled
 
 
 def header_value(headers: list[tuple[bytes, bytes]], name: str) -> str | None:
@@ -78,6 +78,26 @@ async def handle_telegram(scope, receive, send) -> None:
         await send_json(send, 500, {"ok": False, "error": str(exc)})
 
 
+async def handle_health(send) -> None:
+    config = get_config()
+    await send_json(
+        send,
+        200,
+        {
+            "ok": True,
+            "event_id": config["event_id"],
+            "category_id": config["category_id"],
+            "months_ahead": config["months_ahead"],
+            "status_interval_seconds": config["status_interval_seconds"],
+            "telegram_bot_configured": bool(config["telegram_bot_token"]),
+            "telegram_webhook_configured": bool(config["telegram_webhook_secret"]),
+            "telegram_default_chat_configured": bool(config["telegram_chat_id"]),
+            "supabase_configured": supabase_enabled(config),
+            "cron_secret_configured": bool(os.environ.get("CRON_SECRET")),
+        },
+    )
+
+
 async def app(scope, receive, send) -> None:
     if scope.get("type") != "http":
         await send_json(send, 404, {"ok": False, "error": "not found"})
@@ -88,5 +108,7 @@ async def app(scope, receive, send) -> None:
         await handle_check(scope, send)
     elif path in {"/api/telegram", "/telegram"}:
         await handle_telegram(scope, receive, send)
+    elif path in {"/api/health", "/health"}:
+        await handle_health(send)
     else:
         await send_json(send, 404, {"ok": False, "error": "not found"})
