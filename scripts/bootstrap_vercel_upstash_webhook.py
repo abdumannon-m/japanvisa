@@ -176,8 +176,13 @@ def main() -> int:
         for name in github_secret_names:
             set_github_secret(name, values[name][0], args.repo)
 
-    deployed_url = deploy(args.scope) or production_url
-    result = set_webhook(deployed_url, token, webhook_secret)
+    # Deploy for its side effect, but always register the STABLE production
+    # alias with Telegram. The per-deployment URL printed by `vercel deploy`
+    # (japanvisa-<hash>-<team>.vercel.app) is behind Vercel Deployment
+    # Protection (SSO), which returns a 302 login redirect that Telegram cannot
+    # follow, so the webhook silently never delivers.
+    deploy(args.scope)
+    result = set_webhook(production_url, token, webhook_secret)
     print(f"Registered Telegram webhook: {result['url']}")
     print("Done. Restart the GitHub Actions monitor so it uses TELEGRAM_WEBHOOK_SECRET and Upstash.")
     return 0
