@@ -66,6 +66,7 @@ Environment variables:
 ```text
 EVENT_ID=20
 CATEGORY_ID=12
+PLAN_ID=19
 MONTHS_AHEAD=2
 EVENT_LABEL=Short stay - Applicant
 MONTH_PARAM=date
@@ -80,7 +81,7 @@ SUPABASE_SERVICE_KEY=
 CRON_SECRET= only for Vercel /api/check
 ```
 
-The default `EVENT_ID=20` is the UI tab used for the booking link and Referer header. The default `CATEGORY_ID=12` is the actual short-stay visa Applicant calendar category used by the AJAX endpoint. `MONTH_PARAM=date` is the discovered next-month request field and can be overridden if the embassy changes the endpoint.
+The default `EVENT_ID=20`, `CATEGORY_ID=12`, and `PLAN_ID=19` are the live values selected by the reservation site for `VISA Application for short stay (Applicant)`. The booking link includes both `event=20` and `category=12`; using only `event=20` currently opens the COE calendar. `MONTH_PARAM=date` is the discovered next-month request field and can be overridden if the embassy changes the endpoint.
 
 ## Probe Mode
 

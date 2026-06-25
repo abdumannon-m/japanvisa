@@ -87,6 +87,7 @@ async def handle_health(send) -> None:
             "ok": True,
             "event_id": config["event_id"],
             "category_id": config["category_id"],
+            "plan_id": config["plan_id"],
             "months_ahead": config["months_ahead"],
             "status_interval_seconds": config["status_interval_seconds"],
             "telegram_bot_configured": bool(config["telegram_bot_token"]),

@@ -43,6 +43,7 @@ jobs:
           STATE_KEY: "event-20"
           EVENT_ID: "20"
           CATEGORY_ID: "12"
+          PLAN_ID: "19"
           MONTHS_AHEAD: "2"
           EVENT_LABEL: "Short stay - Applicant"
           STATUS_INTERVAL_SECONDS: "3600"

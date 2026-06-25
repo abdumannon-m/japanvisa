@@ -63,6 +63,7 @@ def get_config() -> dict[str, Any]:
     return {
         "event_id": event_id,
         "category_id": os.getenv("CATEGORY_ID", "12"),
+        "plan_id": os.getenv("PLAN_ID", "19"),
         "months_ahead": env_int("MONTHS_AHEAD", 2),
         "event_label": os.getenv("EVENT_LABEL", "Short stay - Applicant"),
         "month_param": os.getenv("MONTH_PARAM", "date"),
@@ -92,8 +93,15 @@ def parse_year_month(text: str) -> str:
     return f"{int(year):04d}-{int(month):02d}"
 
 
-def booking_url(event_id: str) -> str:
-    return f"{BASE}?{urllib.parse.urlencode({'event': event_id})}"
+def booking_url(event_id: str, category_id: str | None = None) -> str:
+    query = {"event": event_id}
+    if category_id:
+        query["category"] = category_id
+    return f"{BASE}?{urllib.parse.urlencode(query)}"
+
+
+def configured_booking_url(config: dict[str, Any]) -> str:
+    return booking_url(str(config["event_id"]), str(config["category_id"]))
 
 
 def import_requests() -> Any:
@@ -413,7 +421,7 @@ def ajax_headers(config: dict[str, Any]) -> dict[str, str]:
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://uzembassyryouji.rsvsys.jp",
-        "Referer": booking_url(str(config["event_id"])),
+        "Referer": configured_booking_url(config),
         "User-Agent": USER_AGENT,
     }
 
@@ -422,7 +430,7 @@ def new_calendar_session(config: dict[str, Any]) -> Any:
     requests = import_requests()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    response = session.get(booking_url(str(config["event_id"])), timeout=30)
+    response = session.get(configured_booking_url(config), timeout=30)
     response.raise_for_status()
     if not session.cookies.get("USERSESSID") or not session.cookies.get("csrfToken"):
         raise RuntimeError("Initial calendar GET did not set required USERSESSID/csrfToken cookies")
@@ -440,6 +448,9 @@ def fetch_calendar_html(
 
     data = {
         "category": str(config["category_id"]),
+        "event": str(config["event_id"]),
+        "plan": str(config["plan_id"]),
+        "disp_type": "month",
         "_csrfToken": csrf_token,
         "search": "exec",
     }
@@ -498,7 +509,7 @@ def probe_month_params(session: Any, config: dict[str, Any], current_month: str)
 def run_probe() -> None:
     config = get_config()
     session = new_calendar_session(config)
-    print(f"[probe] GET {booking_url(str(config['event_id']))}")
+    print(f"[probe] GET {configured_booking_url(config)}")
     print(f"[probe] cookies={json.dumps(redacted_cookies(session), sort_keys=True)}")
 
     html_doc, raw_response = fetch_calendar_html(session, config)
@@ -563,7 +574,7 @@ def build_message(date_key: str, alt: str, config: dict[str, Any]) -> str:
     label = html.escape(str(config["event_label"]))
     escaped_date = html.escape(date_key)
     escaped_alt = html.escape(alt)
-    escaped_url = html.escape(booking_url(str(config["event_id"])), quote=True)
+    escaped_url = html.escape(configured_booking_url(config), quote=True)
     return (
         f"<b>Japan visa slot open</b>\n"
         f"{label}\n"
@@ -577,7 +588,7 @@ def build_message(date_key: str, alt: str, config: dict[str, Any]) -> str:
 def build_alert_message(date_keys: list[str], current: dict[str, str], config: dict[str, Any]) -> str:
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     label = html.escape(str(config["event_label"]))
-    escaped_url = html.escape(booking_url(str(config["event_id"])), quote=True)
+    escaped_url = html.escape(configured_booking_url(config), quote=True)
     lines = [
         "<b>Japan visa slots open</b>",
         label,
@@ -599,7 +610,7 @@ def build_alert_message(date_keys: list[str], current: dict[str, str], config: d
 def build_status_message(current: dict[str, str], config: dict[str, Any]) -> str:
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     label = html.escape(str(config["event_label"]))
-    escaped_url = html.escape(booking_url(str(config["event_id"])), quote=True)
+    escaped_url = html.escape(configured_booking_url(config), quote=True)
     lines = [
         "<b>Japan visa slot status</b>",
         label,
