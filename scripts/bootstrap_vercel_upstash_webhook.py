@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import re
 import secrets
 import subprocess
 import time
@@ -17,6 +18,7 @@ from set_telegram_webhook import set_webhook
 DEFAULT_SCOPE = "abdumannonmurodiy-3405s-projects"
 DEFAULT_URL = "https://japanvisa-nine.vercel.app"
 DEFAULT_REPO = "abdumannon-m/japanvisa"
+URL_RE = re.compile(r"https://[^\s]+")
 
 
 def require_https_url(value: str, label: str) -> str:
@@ -100,8 +102,14 @@ def deploy(scope: str) -> str | None:
     print(result.stdout)
 
     for line in result.stdout.splitlines():
-        if line.startswith("Aliased: https://"):
-            return line.removeprefix("Aliased: ").strip()
+        if line.startswith("Aliased: "):
+            match = URL_RE.search(line)
+            if match:
+                return require_https_url(match.group(0), "Aliased deployment URL")
+        if line.startswith("Production: "):
+            match = URL_RE.search(line)
+            if match:
+                return require_https_url(match.group(0), "Production deployment URL")
     return None
 
 

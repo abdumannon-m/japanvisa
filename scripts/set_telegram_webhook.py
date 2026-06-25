@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -25,8 +26,16 @@ def set_webhook(base_url: str, token: str, secret: str = "") -> dict:
         data=data,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(body)
+        except json.JSONDecodeError:
+            detail = body or exc.reason
+        raise RuntimeError(f"setWebhook failed with HTTP {exc.code}: {detail}") from exc
 
     if not result.get("ok"):
         raise RuntimeError(f"setWebhook failed: {result}")
