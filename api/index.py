@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from check_slots import cycle, get_config, handle_telegram_webhook_update, supabase_enabled
+from check_slots import cycle, get_config, handle_telegram_webhook_update, state_label, supabase_enabled, upstash_enabled
 
 
 def header_value(headers: list[tuple[bytes, bytes]], name: str) -> str | None:
@@ -93,7 +93,9 @@ async def handle_health(send) -> None:
             "telegram_bot_configured": bool(config["telegram_bot_token"]),
             "telegram_webhook_configured": bool(config["telegram_webhook_secret"]),
             "telegram_default_chat_configured": bool(config["telegram_chat_id"]),
+            "upstash_configured": upstash_enabled(config),
             "supabase_configured": supabase_enabled(config),
+            "state_backend": state_label(config),
             "cron_secret_configured": bool(os.environ.get("CRON_SECRET")),
         },
     )

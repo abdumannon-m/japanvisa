@@ -72,6 +72,8 @@ def get_config() -> dict[str, Any]:
         "state_key": os.getenv("STATE_KEY", f"event-{event_id}"),
         "supabase_url": os.getenv("SUPABASE_URL", "").rstrip("/"),
         "supabase_service_key": os.getenv("SUPABASE_SERVICE_KEY", ""),
+        "upstash_redis_rest_url": os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/"),
+        "upstash_redis_rest_token": os.getenv("UPSTASH_REDIS_REST_TOKEN", ""),
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
         "telegram_webhook_secret": os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
@@ -116,6 +118,14 @@ def supabase_enabled(config: dict[str, Any]) -> bool:
     return bool(config["supabase_url"] and config["supabase_service_key"])
 
 
+def upstash_enabled(config: dict[str, Any]) -> bool:
+    return bool(config["upstash_redis_rest_url"] and config["upstash_redis_rest_token"])
+
+
+def remote_state_enabled(config: dict[str, Any]) -> bool:
+    return upstash_enabled(config) or supabase_enabled(config)
+
+
 def supabase_headers(config: dict[str, Any]) -> dict[str, str]:
     service_key = str(config["supabase_service_key"])
     return {
@@ -148,6 +158,93 @@ def normalize_open_days(open_days: set[str] | dict[str, str]) -> dict[str, str]:
     return {str(date_key): "" for date_key in open_days}
 
 
+def apply_open_days(state: dict[str, Any], open_days: Any) -> None:
+    if isinstance(open_days, dict):
+        state["open_dates"] = {str(item) for item in open_days}
+    elif isinstance(open_days, list):
+        state["open_dates"] = {str(item) for item in open_days}
+
+
+def apply_telegram_state(state: dict[str, Any], telegram_state: Any) -> None:
+    if not isinstance(telegram_state, dict):
+        return
+    raw_offset = telegram_state.get("telegram_update_offset")
+    if isinstance(raw_offset, int):
+        state["telegram_update_offset"] = raw_offset
+    raw_chats = telegram_state.get("subscribed_chats", [])
+    if isinstance(raw_chats, list):
+        state["subscribed_chats"] = {str(item) for item in raw_chats}
+    raw_last_status_at = telegram_state.get("last_status_at")
+    if isinstance(raw_last_status_at, str):
+        state["last_status_at"] = raw_last_status_at
+
+
+def upstash_headers(config: dict[str, Any]) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {config['upstash_redis_rest_token']}",
+        "Content-Type": "application/json",
+    }
+
+
+def upstash_command(config: dict[str, Any], *args: Any) -> Any:
+    requests = import_requests()
+    response = requests.post(
+        str(config["upstash_redis_rest_url"]),
+        headers=upstash_headers(config),
+        data=json.dumps(list(args)),
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict) and payload.get("error"):
+        raise RuntimeError(f"Upstash command failed: {payload['error']}")
+    if not isinstance(payload, dict) or "result" not in payload:
+        raise RuntimeError("Upstash command failed: unexpected response")
+    return payload["result"]
+
+
+def read_upstash_value(config: dict[str, Any], key: str) -> Any:
+    raw = upstash_command(config, "GET", key)
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Upstash value for {key} is not valid JSON") from exc
+
+
+def upsert_upstash_value(config: dict[str, Any], key: str, value: dict[str, Any]) -> None:
+    upstash_command(config, "SET", key, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def read_upstash_state(config: dict[str, Any]) -> dict[str, Any]:
+    state = empty_state()
+    apply_open_days(state, read_upstash_value(config, str(config["state_key"])))
+    apply_telegram_state(state, read_upstash_value(config, telegram_state_key(config)))
+    return state
+
+
+def save_upstash_state(
+    config: dict[str, Any],
+    open_days: set[str] | dict[str, str],
+    telegram_update_offset: int | None = None,
+    subscribed_chats: set[str] | None = None,
+    last_status_at: str | None = None,
+) -> None:
+    upsert_upstash_value(config, str(config["state_key"]), normalize_open_days(open_days))
+    upsert_upstash_value(
+        config,
+        telegram_state_key(config),
+        {
+            "telegram_update_offset": telegram_update_offset,
+            "subscribed_chats": sorted(subscribed_chats or set()),
+            "last_status_at": last_status_at,
+        },
+    )
+
+
 def read_supabase_value(config: dict[str, Any], key: str) -> Any:
     requests = import_requests()
     response = requests.get(
@@ -165,23 +262,8 @@ def read_supabase_value(config: dict[str, Any], key: str) -> Any:
 
 def read_supabase_state(config: dict[str, Any]) -> dict[str, Any]:
     state = empty_state()
-    open_days = read_supabase_value(config, str(config["state_key"]))
-    if isinstance(open_days, dict):
-        state["open_dates"] = {str(item) for item in open_days}
-    elif isinstance(open_days, list):
-        state["open_dates"] = {str(item) for item in open_days}
-
-    telegram_state = read_supabase_value(config, telegram_state_key(config))
-    if isinstance(telegram_state, dict):
-        raw_offset = telegram_state.get("telegram_update_offset")
-        if isinstance(raw_offset, int):
-            state["telegram_update_offset"] = raw_offset
-        raw_chats = telegram_state.get("subscribed_chats", [])
-        if isinstance(raw_chats, list):
-            state["subscribed_chats"] = {str(item) for item in raw_chats}
-        raw_last_status_at = telegram_state.get("last_status_at")
-        if isinstance(raw_last_status_at, str):
-            state["last_status_at"] = raw_last_status_at
+    apply_open_days(state, read_supabase_value(config, str(config["state_key"])))
+    apply_telegram_state(state, read_supabase_value(config, telegram_state_key(config)))
     return state
 
 
@@ -224,6 +306,8 @@ def save_supabase_state(
 
 
 def state_label(config: dict[str, Any]) -> str:
+    if upstash_enabled(config):
+        return f"upstash:{config['state_key']}"
     if supabase_enabled(config):
         return f"supabase:{config['state_key']}"
     return str(config["state_file"])
@@ -231,6 +315,8 @@ def state_label(config: dict[str, Any]) -> str:
 
 def read_state(path: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
     config = config or get_config()
+    if upstash_enabled(config):
+        return read_upstash_state(config)
     if supabase_enabled(config):
         return read_supabase_state(config)
 
@@ -282,6 +368,9 @@ def save_state(
     last_status_at: str | None = None,
 ) -> None:
     config = config or get_config()
+    if upstash_enabled(config):
+        save_upstash_state(config, open_days, telegram_update_offset, subscribed_chats, last_status_at)
+        return
     if supabase_enabled(config):
         save_supabase_state(config, open_days, telegram_update_offset, subscribed_chats, last_status_at)
         return
@@ -867,16 +956,16 @@ def save_telegram_metadata(
     subscribed_chats: set[str],
     last_status_at: str | None,
 ) -> None:
-    if supabase_enabled(config):
-        upsert_supabase_value(
-            config,
-            telegram_state_key(config),
-            {
-                "telegram_update_offset": telegram_update_offset,
-                "subscribed_chats": sorted(subscribed_chats),
-                "last_status_at": last_status_at,
-            },
-        )
+    if remote_state_enabled(config):
+        value = {
+            "telegram_update_offset": telegram_update_offset,
+            "subscribed_chats": sorted(subscribed_chats),
+            "last_status_at": last_status_at,
+        }
+        if upstash_enabled(config):
+            upsert_upstash_value(config, telegram_state_key(config), value)
+        else:
+            upsert_supabase_value(config, telegram_state_key(config), value)
         return
 
     state = read_state(path, config)
