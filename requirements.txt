@@ -1,1 +1,2 @@
-requests>=2.31,<3
+# Pin to a single minor line for reproducible, definitely-resolvable builds.
+requests>=2.32,<2.33

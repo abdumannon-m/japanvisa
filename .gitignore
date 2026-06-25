@@ -1,6 +1,9 @@
 state.json
 __pycache__/
 *.pyc
+venv/
+.venv/
+env/
 .env
 .env.local
 .env.*.local

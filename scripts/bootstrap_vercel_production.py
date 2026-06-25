@@ -102,6 +102,7 @@ def main() -> int:
     values = {
         "EVENT_ID": ("20", False),
         "CATEGORY_ID": ("12", False),
+        "PLAN_ID": ("19", False),
         "MONTHS_AHEAD": ("2", False),
         "EVENT_LABEL": ("Short stay - Applicant", False),
         "MONTH_PARAM": ("date", False),

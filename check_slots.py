@@ -29,6 +29,7 @@ USER_AGENT = (
 )
 NEG = [
     "not available",
+    "unavailable",
     "qabul tugadi",
     "qabul yakunlandi",
     "приём окончен",
@@ -36,42 +37,62 @@ NEG = [
     "受付終了",
     "受付は終了",
 ]
-POS = [
+# Latin-script positive keywords must match on word boundaries so that, for
+# example, "available" never matches inside "unavailable".
+POS_WORD = [
+    "few",
+    "available",
+]
+# CJK/Cyrillic keywords have no usable word boundaries, so match as substrings.
+POS_SUBSTRING = [
     "qabul qilinmoqda",
     "ведётся",
     "ведется",
     "受付中",
     "残りわずか",
-    "few",
-    "available",
 ]
+# Retained for backwards compatibility / introspection.
+POS = POS_WORD + POS_SUBSTRING
 
 
 def env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def env_int(name: str, default: int) -> int:
+def env_int(
+    name: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     raw = env_str(name)
     if not raw:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         print(f"[warn] Invalid {name}={raw!r}; using {default}", file=sys.stderr)
         return default
+    if minimum is not None and value < minimum:
+        print(f"[warn] {name}={value} below minimum {minimum}; using {default}", file=sys.stderr)
+        return default
+    if maximum is not None and value > maximum:
+        print(f"[warn] {name}={value} above maximum {maximum}; using {default}", file=sys.stderr)
+        return default
+    return value
 
 
 def get_config() -> dict[str, Any]:
     event_id = env_str("EVENT_ID", "20")
+    telegram_chat_id = env_str("TELEGRAM_CHAT_ID")
     return {
         "event_id": event_id,
         "category_id": env_str("CATEGORY_ID", "12"),
         "plan_id": env_str("PLAN_ID", "19"),
-        "months_ahead": env_int("MONTHS_AHEAD", 2),
+        "months_ahead": env_int("MONTHS_AHEAD", 2, minimum=0),
         "event_label": env_str("EVENT_LABEL", "Short stay - Applicant"),
         "month_param": env_str("MONTH_PARAM", "date"),
-        "status_interval_seconds": env_int("STATUS_INTERVAL_SECONDS", 3600),
+        "status_interval_seconds": env_int("STATUS_INTERVAL_SECONDS", 3600, minimum=60),
         "state_file": Path(env_str("STATE_FILE", "state.json")),
         "state_key": env_str("STATE_KEY", f"event-{event_id}"),
         "supabase_url": env_str("SUPABASE_URL").rstrip("/"),
@@ -79,16 +100,26 @@ def get_config() -> dict[str, Any]:
         "upstash_redis_rest_url": env_str("UPSTASH_REDIS_REST_URL").rstrip("/"),
         "upstash_redis_rest_token": env_str("UPSTASH_REDIS_REST_TOKEN"),
         "telegram_bot_token": env_str("TELEGRAM_BOT_TOKEN"),
-        "telegram_chat_id": env_str("TELEGRAM_CHAT_ID"),
+        "telegram_chat_id": telegram_chat_id,
         "telegram_webhook_secret": env_str("TELEGRAM_WEBHOOK_SECRET"),
     }
 
 
 def is_open(alt: str | None) -> bool:
     text = (alt or "").lower()
+    # Evaluate the negative list first: a closed day must never read as open.
     if any(part in text for part in NEG):
         return False
-    return any(part in text for part in POS)
+    matched = any(re.search(rf"\b{re.escape(part)}\b", text) for part in POS_WORD)
+    matched = matched or any(part in text for part in POS_SUBSTRING)
+    if matched:
+        return True
+    # The alt text matched neither list. Treat as closed (safe default) but warn
+    # so future site wording drift is visible instead of silently swallowed.
+    stripped = text.strip()
+    if stripped:
+        print(f"[warn] Unrecognized slot alt text (treating as closed): {alt!r}", file=sys.stderr)
+    return False
 
 
 def parse_year_month(text: str) -> str:
@@ -116,6 +147,62 @@ def import_requests() -> Any:
     except ImportError as exc:
         raise RuntimeError("Missing dependency: install requests with `python -m pip install -r requirements.txt`") from exc
     return requests
+
+
+# Per-request network timeout (seconds). Kept short so total wall time across
+# retries stays well under a 60s serverless limit.
+HTTP_TIMEOUT = 15
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1.0
+RETRY_MAX_DELAY = 8.0
+
+
+def _retry_status_code(exc: Exception) -> int | None:
+    """Best-effort HTTP status extraction for requests/urllib/telegram errors."""
+    direct = getattr(exc, "status_code", None)
+    if isinstance(direct, int):
+        return direct
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    return None
+
+
+def _is_transient(exc: Exception) -> bool:
+    status = _retry_status_code(exc)
+    if status is not None:
+        return status == 429 or 500 <= status <= 599
+    # Network/timeout/connection errors are transient. We avoid importing
+    # requests at module import time, so match on class name as a fallback.
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        return True
+    name = exc.__class__.__name__
+    return name in {"Timeout", "ConnectionError", "ConnectTimeout", "ReadTimeout", "ChunkedEncodingError"}
+
+
+def with_retries(func: Any, *, what: str, attempts: int = RETRY_ATTEMPTS) -> Any:
+    """Call ``func`` with bounded exponential backoff on transient failures."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as exc:  # noqa: BLE001 - re-raised below if not transient
+            last_exc = exc
+            if attempt >= attempts or not _is_transient(exc):
+                raise
+            delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+            print(
+                f"[warn] {what} transient failure (attempt {attempt}/{attempts}): {exc}; "
+                f"retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def supabase_enabled(config: dict[str, Any]) -> bool:
@@ -147,9 +234,14 @@ def telegram_state_key(config: dict[str, Any]) -> str:
     return f"{config['state_key']}:telegram"
 
 
+def telegram_subscribers_key(config: dict[str, Any]) -> str:
+    return f"{config['state_key']}:telegram:subscribers"
+
+
 def empty_state() -> dict[str, Any]:
     return {
         "open_dates": set(),
+        "open_day_alts": {},
         "telegram_update_offset": None,
         "subscribed_chats": set(),
         "last_status_at": None,
@@ -162,10 +254,27 @@ def normalize_open_days(open_days: set[str] | dict[str, str]) -> dict[str, str]:
     return {str(date_key): "" for date_key in open_days}
 
 
+def telegram_state_value(
+    telegram_update_offset: int | None,
+    subscribed_chats: set[str] | None,
+    last_status_at: str | None,
+) -> dict[str, Any]:
+    """Single source of truth for the persisted telegram sub-state shape."""
+    return {
+        "telegram_update_offset": telegram_update_offset,
+        "subscribed_chats": sorted(subscribed_chats or set()),
+        "last_status_at": last_status_at,
+    }
+
+
 def apply_open_days(state: dict[str, Any], open_days: Any) -> None:
     if isinstance(open_days, dict):
+        # Preserve the {date: alt} mapping so the real slot status survives a
+        # round-trip through state; also expose the set for date arithmetic.
+        state["open_day_alts"] = {str(key): str(value) for key, value in open_days.items()}
         state["open_dates"] = {str(item) for item in open_days}
     elif isinstance(open_days, list):
+        state["open_day_alts"] = {str(item): "" for item in open_days}
         state["open_dates"] = {str(item) for item in open_days}
 
 
@@ -192,13 +301,18 @@ def upstash_headers(config: dict[str, Any]) -> dict[str, str]:
 
 def upstash_command(config: dict[str, Any], *args: Any) -> Any:
     requests = import_requests()
-    response = requests.post(
-        str(config["upstash_redis_rest_url"]),
-        headers=upstash_headers(config),
-        data=json.dumps(list(args)),
-        timeout=30,
-    )
-    response.raise_for_status()
+
+    def call() -> Any:
+        response = requests.post(
+            str(config["upstash_redis_rest_url"]),
+            headers=upstash_headers(config),
+            data=json.dumps(list(args)),
+            timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response
+
+    response = with_retries(call, what="Upstash command")
     payload = response.json()
     if isinstance(payload, dict) and payload.get("error"):
         raise RuntimeError(f"Upstash command failed: {payload['error']}")
@@ -223,10 +337,38 @@ def upsert_upstash_value(config: dict[str, Any], key: str, value: dict[str, Any]
     upstash_command(config, "SET", key, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
+def upstash_read_subscribers(config: dict[str, Any]) -> set[str]:
+    result = upstash_command(config, "SMEMBERS", telegram_subscribers_key(config))
+    if isinstance(result, list):
+        return {str(item) for item in result}
+    return set()
+
+
+def upstash_add_subscriber(config: dict[str, Any], chat_id: str) -> None:
+    upstash_command(config, "SADD", telegram_subscribers_key(config), str(chat_id))
+
+
+def upstash_remove_subscriber(config: dict[str, Any], chat_id: str) -> None:
+    upstash_command(config, "SREM", telegram_subscribers_key(config), str(chat_id))
+
+
+def apply_subscriber_delta(config: dict[str, Any], added: set[str], removed: set[str]) -> None:
+    """Atomically apply subscribe/unsubscribe deltas using Redis SET ops."""
+    for chat_id in sorted(added):
+        upstash_add_subscriber(config, chat_id)
+    for chat_id in sorted(removed):
+        upstash_remove_subscriber(config, chat_id)
+
+
 def read_upstash_state(config: dict[str, Any]) -> dict[str, Any]:
     state = empty_state()
     apply_open_days(state, read_upstash_value(config, str(config["state_key"])))
     apply_telegram_state(state, read_upstash_value(config, telegram_state_key(config)))
+    # Subscribers live in an atomic Redis SET. Prefer it; fall back to the JSON
+    # blob (legacy/migration) when the SET is empty.
+    set_chats = upstash_read_subscribers(config)
+    if set_chats:
+        state["subscribed_chats"] = set_chats
     return state
 
 
@@ -241,23 +383,24 @@ def save_upstash_state(
     upsert_upstash_value(
         config,
         telegram_state_key(config),
-        {
-            "telegram_update_offset": telegram_update_offset,
-            "subscribed_chats": sorted(subscribed_chats or set()),
-            "last_status_at": last_status_at,
-        },
+        telegram_state_value(telegram_update_offset, subscribed_chats, last_status_at),
     )
 
 
 def read_supabase_value(config: dict[str, Any], key: str) -> Any:
     requests = import_requests()
-    response = requests.get(
-        supabase_state_url(config),
-        headers=supabase_headers(config),
-        params={"key": f"eq.{key}", "select": "value"},
-        timeout=30,
-    )
-    response.raise_for_status()
+
+    def call() -> Any:
+        response = requests.get(
+            supabase_state_url(config),
+            headers=supabase_headers(config),
+            params={"key": f"eq.{key}", "select": "value"},
+            timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response
+
+    response = with_retries(call, what="Supabase read")
     rows = response.json()
     if not rows:
         return {}
@@ -280,14 +423,19 @@ def upsert_supabase_value(config: dict[str, Any], key: str, value: dict[str, Any
     }
     headers = supabase_headers(config)
     headers["Prefer"] = "resolution=merge-duplicates"
-    response = requests.post(
-        supabase_state_url(config),
-        headers=headers,
-        params={"on_conflict": "key"},
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
+
+    def call() -> Any:
+        response = requests.post(
+            supabase_state_url(config),
+            headers=headers,
+            params={"on_conflict": "key"},
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response
+
+    with_retries(call, what="Supabase write")
 
 
 def save_supabase_state(
@@ -301,11 +449,7 @@ def save_supabase_state(
     upsert_supabase_value(
         config,
         telegram_state_key(config),
-        {
-            "telegram_update_offset": telegram_update_offset,
-            "subscribed_chats": sorted(subscribed_chats or set()),
-            "last_status_at": last_status_at,
-        },
+        telegram_state_value(telegram_update_offset, subscribed_chats, last_status_at),
     )
 
 
@@ -315,6 +459,17 @@ def state_label(config: dict[str, Any]) -> str:
     if supabase_enabled(config):
         return f"supabase:{config['state_key']}"
     return str(config["state_file"])
+
+
+def warn_if_ephemeral_state(config: dict[str, Any]) -> None:
+    """Loudly warn when running without durable state (ephemeral on serverless)."""
+    if not remote_state_enabled(config):
+        print(
+            "[warn] No durable state backend configured (UPSTASH/SUPABASE unset); "
+            f"using local file {config['state_file']} which is EPHEMERAL on serverless "
+            "and will not persist across invocations — slot dedup/alerts may repeat or be lost.",
+            file=sys.stderr,
+        )
 
 
 def read_state(path: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -336,13 +491,20 @@ def read_state(path: Path, config: dict[str, Any] | None = None) -> dict[str, An
 
     if isinstance(data, list):
         state["open_dates"] = {str(item) for item in data}
+        state["open_day_alts"] = {str(item): "" for item in data}
         return state
     if not isinstance(data, dict):
         return state
 
-    raw_dates = data.get("open_dates", [])
-    if isinstance(raw_dates, list):
-        state["open_dates"] = {str(item) for item in raw_dates}
+    raw_alts = data.get("open_day_alts")
+    if isinstance(raw_alts, dict):
+        state["open_day_alts"] = {str(key): str(value) for key, value in raw_alts.items()}
+        state["open_dates"] = {str(key) for key in raw_alts}
+    else:
+        raw_dates = data.get("open_dates", [])
+        if isinstance(raw_dates, list):
+            state["open_dates"] = {str(item) for item in raw_dates}
+            state["open_day_alts"] = {str(item): "" for item in raw_dates}
 
     raw_offset = data.get("telegram_update_offset")
     if isinstance(raw_offset, int):
@@ -379,13 +541,12 @@ def save_state(
         save_supabase_state(config, open_days, telegram_update_offset, subscribed_chats, last_status_at)
         return
 
-    open_dates = set(open_days) if isinstance(open_days, dict) else set(open_days)
+    open_day_alts = normalize_open_days(open_days)
     payload = {
-        "open_dates": sorted(open_dates),
-        "subscribed_chats": sorted(subscribed_chats or set()),
-        "telegram_update_offset": telegram_update_offset,
-        "last_status_at": last_status_at,
+        "open_dates": sorted(open_day_alts),
+        "open_day_alts": open_day_alts,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **telegram_state_value(telegram_update_offset, subscribed_chats, last_status_at),
     }
     if path.parent != Path("."):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -523,8 +684,13 @@ def new_calendar_session(config: dict[str, Any]) -> Any:
     requests = import_requests()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    response = session.get(configured_booking_url(config), timeout=30)
-    response.raise_for_status()
+
+    def call() -> Any:
+        response = session.get(configured_booking_url(config), timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        return response
+
+    with_retries(call, what="calendar GET")
     if not session.cookies.get("USERSESSID") or not session.cookies.get("csrfToken"):
         raise RuntimeError("Initial calendar GET did not set required USERSESSID/csrfToken cookies")
     return session
@@ -550,8 +716,12 @@ def fetch_calendar_html(
     if target_month:
         data[str(config["month_param"])] = month_param_value(target_month)
 
-    response = session.post(AJAX_URL, headers=ajax_headers(config), data=data, timeout=30)
-    response.raise_for_status()
+    def call() -> Any:
+        response = session.post(AJAX_URL, headers=ajax_headers(config), data=data, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        return response
+
+    response = with_retries(call, what="calendar POST")
     return extract_html(response.text), response.text
 
 
@@ -662,22 +832,6 @@ def run_once() -> dict[str, str]:
     return current_open
 
 
-def build_message(date_key: str, alt: str, config: dict[str, Any]) -> str:
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    label = html.escape(str(config["event_label"]))
-    escaped_date = html.escape(date_key)
-    escaped_alt = html.escape(alt)
-    escaped_url = html.escape(configured_booking_url(config), quote=True)
-    return (
-        f"<b>Japan visa slot open</b>\n"
-        f"{label}\n"
-        f"Date: <b>{escaped_date}</b>\n"
-        f"Status: {escaped_alt}\n"
-        f"Book: <a href=\"{escaped_url}\">reservation calendar</a>\n"
-        f"Checked: {timestamp} UTC"
-    )
-
-
 def build_alert_message(date_keys: list[str], current: dict[str, str], config: dict[str, Any]) -> str:
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     label = html.escape(str(config["event_label"]))
@@ -776,21 +930,53 @@ def should_send_status(last_status_at: str | None, interval_seconds: int, now: d
     return (now - previous).total_seconds() >= interval_seconds
 
 
-def send_to_alert_targets(message: str, config: dict[str, Any], alert_targets: set[str]) -> list[str]:
-    errors: list[str] = []
+# Small delay between subscriber sends to stay under Telegram's broadcast rate.
+INTER_SEND_DELAY = 0.1
+
+
+class AlertResult:
+    """Outcome of a broadcast: which chats failed and which are permanently dead."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.failed: set[str] = set()
+        self.terminal: set[str] = set()
+        self.dry_run_failed = False
+
+
+def send_to_alert_targets(
+    message: str,
+    config: dict[str, Any],
+    alert_targets: set[str],
+) -> AlertResult:
+    """Send ``message`` to every target.
+
+    Returns an AlertResult capturing per-chat errors, the set of chats that
+    failed, and the subset that failed permanently (403 blocked / 400
+    chat-not-found) and should be removed from the subscriber list. Never raises
+    on a per-chat send failure.
+    """
+    result = AlertResult()
     if not config["telegram_bot_token"] or not alert_targets:
         try:
             send_telegram(message, config)
         except Exception as exc:
-            errors.append(str(exc))
-        return errors
+            result.errors.append(str(exc))
+            result.dry_run_failed = True
+        return result
 
-    for chat_id in sorted(alert_targets):
+    targets = sorted(alert_targets)
+    for index, chat_id in enumerate(targets):
         try:
             send_telegram_to_chat(config["telegram_bot_token"], chat_id, message)
         except Exception as exc:
-            errors.append(str(exc))
-    return errors
+            result.errors.append(f"chat {chat_id}: {exc}")
+            result.failed.add(chat_id)
+            if telegram_is_terminal(exc):
+                result.terminal.add(chat_id)
+        if index < len(targets) - 1:
+            time.sleep(INTER_SEND_DELAY)
+    return result
 
 
 def handle_telegram_message(
@@ -834,29 +1020,83 @@ def handle_telegram_message(
     return subscribed_chats, True, True, None
 
 
-def telegram_request(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
-    data = urllib.parse.urlencode(
-        params
-    ).encode("utf-8")
+class TelegramError(RuntimeError):
+    """Telegram API error carrying the HTTP status code when available."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def telegram_is_terminal(exc: Exception) -> bool:
+    """403 (blocked/kicked) and 400 (chat not found) are permanent for a chat."""
+    return isinstance(exc, TelegramError) and exc.status_code in {400, 403}
+
+
+def _telegram_request_once(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
+    data = urllib.parse.urlencode(params).encode("utf-8")
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/{method}",
         data=data,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
+        retry_after: int | None = None
         try:
-            detail = json.loads(body).get("description", body)
+            parsed = json.loads(body)
+            detail = parsed.get("description", body)
+            params_field = parsed.get("parameters")
+            if isinstance(params_field, dict):
+                raw_retry = params_field.get("retry_after")
+                if isinstance(raw_retry, int):
+                    retry_after = raw_retry
         except json.JSONDecodeError:
             detail = body or HTTPStatus(exc.code).phrase
-        raise RuntimeError(f"Telegram {method} failed: {detail}") from exc
+        err = TelegramError(f"Telegram {method} failed: {detail}", status_code=exc.code)
+        err.retry_after = retry_after  # type: ignore[attr-defined]
+        raise err from exc
 
     if not payload.get("ok"):
-        raise RuntimeError(f"Telegram {method} failed: {payload.get('description', 'unknown error')}")
+        raise TelegramError(f"Telegram {method} failed: {payload.get('description', 'unknown error')}")
     return payload
+
+
+def telegram_request(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return _telegram_request_once(token, method, params)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= RETRY_ATTEMPTS:
+                raise
+            status = getattr(exc, "status_code", None)
+            if status == 429:
+                retry_after = getattr(exc, "retry_after", None)
+                delay = float(retry_after) if isinstance(retry_after, int) else RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                delay = min(delay, RETRY_MAX_DELAY)
+                print(
+                    f"[warn] Telegram {method} rate-limited (attempt {attempt}/{RETRY_ATTEMPTS}); "
+                    f"retrying in {delay:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            if not _is_transient(exc):
+                raise
+            delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+            print(
+                f"[warn] Telegram {method} transient failure (attempt {attempt}/{RETRY_ATTEMPTS}): {exc}; "
+                f"retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def send_telegram_to_chat(token: str, chat_id: str, message: str) -> None:
@@ -932,10 +1172,9 @@ def process_telegram_commands(
     next_offset = offset
     for update in updates:
         update_id = update.get("update_id")
-        if isinstance(update_id, int):
-            next_offset = update_id + 1
 
         message = update.get("message")
+        reply_failed = False
         if isinstance(message, dict):
             subscribed_chats, command_seen, reply_sent, error = handle_telegram_message(
                 message,
@@ -949,8 +1188,78 @@ def process_telegram_commands(
                 stats["replies"] += 1
             if error:
                 errors.append(error)
+                # A command was recognized but its reply failed to send. Do NOT
+                # advance the offset past it so the read-only command is retried
+                # next cycle instead of being silently swallowed.
+                if command_seen and not reply_sent:
+                    reply_failed = True
+
+        if reply_failed:
+            break
+        if isinstance(update_id, int):
+            next_offset = update_id + 1
 
     return next_offset, subscribed_chats, errors, stats
+
+
+def persist_telegram_metadata(
+    config: dict[str, Any],
+    path: Path,
+    telegram_update_offset: int | None,
+    subscribed_chats: set[str],
+    last_status_at: str | None,
+    previous_chats: set[str] | None = None,
+) -> None:
+    """Persist telegram sub-state without clobbering a concurrent writer.
+
+    ``previous_chats`` is the subscriber snapshot this caller started from; the
+    delta against ``subscribed_chats`` is applied atomically (Upstash SET ops) or
+    merged onto a fresh read (Supabase/local) so a slow scan cannot revert a
+    subscribe/unsubscribe that happened meanwhile.
+    """
+    previous = set(previous_chats) if previous_chats is not None else set(subscribed_chats)
+    added = subscribed_chats - previous
+    removed = previous - subscribed_chats
+
+    if upstash_enabled(config):
+        # Seed the SET from the blob on first migration if it is empty.
+        existing = upstash_read_subscribers(config)
+        if not existing and previous:
+            for chat_id in sorted(previous):
+                upstash_add_subscriber(config, chat_id)
+        apply_subscriber_delta(config, added, removed)
+        merged = (upstash_read_subscribers(config) | added) - removed
+        upsert_upstash_value(
+            config,
+            telegram_state_key(config),
+            telegram_state_value(telegram_update_offset, merged, last_status_at),
+        )
+        return
+
+    if supabase_enabled(config):
+        fresh = read_supabase_state(config)
+        merged = (set(fresh["subscribed_chats"]) | added) - removed
+        merged_offset = telegram_update_offset
+        if isinstance(fresh["telegram_update_offset"], int):
+            merged_offset = max(telegram_update_offset or 0, fresh["telegram_update_offset"])
+        upsert_supabase_value(
+            config,
+            telegram_state_key(config),
+            telegram_state_value(merged_offset, merged, last_status_at),
+        )
+        return
+
+    # Local file: re-read immediately before writing and merge the delta.
+    state = read_state(path, config)
+    merged = (set(state["subscribed_chats"]) | added) - removed
+    save_state(
+        path,
+        state["open_day_alts"],
+        telegram_update_offset,
+        merged,
+        config,
+        last_status_at,
+    )
 
 
 def save_telegram_metadata(
@@ -959,37 +1268,26 @@ def save_telegram_metadata(
     telegram_update_offset: int | None,
     subscribed_chats: set[str],
     last_status_at: str | None,
+    previous_chats: set[str] | None = None,
 ) -> None:
-    if remote_state_enabled(config):
-        value = {
-            "telegram_update_offset": telegram_update_offset,
-            "subscribed_chats": sorted(subscribed_chats),
-            "last_status_at": last_status_at,
-        }
-        if upstash_enabled(config):
-            upsert_upstash_value(config, telegram_state_key(config), value)
-        else:
-            upsert_supabase_value(config, telegram_state_key(config), value)
-        return
-
-    state = read_state(path, config)
-    save_state(
+    persist_telegram_metadata(
+        config,
         path,
-        set(state["open_dates"]),
         telegram_update_offset,
         subscribed_chats,
-        config,
         last_status_at,
+        previous_chats,
     )
 
 
 def poll_telegram_commands_once(current: dict[str, str], config: dict[str, Any]) -> None:
     state = read_state(config["state_file"], config)
+    previous_chats = set(state["subscribed_chats"])
     telegram_update_offset, subscribed_chats, command_errors, command_stats = process_telegram_commands(
         current,
         config,
         state["telegram_update_offset"],
-        set(state["subscribed_chats"]),
+        set(previous_chats),
     )
     if command_stats["updates"] or command_stats["commands"] or command_stats["replies"]:
         print(
@@ -1008,11 +1306,20 @@ def poll_telegram_commands_once(current: dict[str, str], config: dict[str, Any])
         telegram_update_offset,
         subscribed_chats,
         state["last_status_at"],
+        previous_chats,
     )
 
 
 def current_from_state(state: dict[str, Any]) -> dict[str, str]:
-    return {str(date_key): "Available" for date_key in sorted(state["open_dates"])}
+    alts = state.get("open_day_alts") or {}
+    result: dict[str, str] = {}
+    for date_key in sorted(state["open_dates"]):
+        key = str(date_key)
+        alt = str(alts.get(key) or "").strip()
+        # Surface the real stored slot status; fall back only when absent so
+        # /status shows the true alt text instead of a fabricated "Available".
+        result[key] = alt or "Available"
+    return result
 
 
 def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
@@ -1022,9 +1329,21 @@ def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
 
     state = read_state(config["state_file"], config)
     current = current_from_state(state)
-    subscribed_chats = set(state["subscribed_chats"])
+    stats = {"commands": 0, "replies": 0, "skipped": 0}
+
+    # update_id de-duplication: Telegram redelivers updates for ~24h if it does
+    # not receive a prompt 200. Use telegram_update_offset as a high-water mark
+    # and skip any update we have already processed.
+    update_id = update.get("update_id")
+    high_water = state["telegram_update_offset"]
+    if isinstance(update_id, int) and isinstance(high_water, int) and update_id < high_water:
+        stats["skipped"] = 1
+        return stats
+
+    previous_chats = set(state["subscribed_chats"])
+    subscribed_chats = set(previous_chats)
     message = update.get("message")
-    stats = {"commands": 0, "replies": 0}
+    error: str | None = None
     if isinstance(message, dict):
         subscribed_chats, command_seen, reply_sent, error = handle_telegram_message(
             message,
@@ -1036,32 +1355,65 @@ def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
             stats["commands"] += 1
         if reply_sent:
             stats["replies"] += 1
-        if error:
-            raise RuntimeError(error)
 
+    # Advance the high-water mark to update_id + 1 (so this id is not reprocessed).
+    next_offset = state["telegram_update_offset"]
+    if isinstance(update_id, int):
+        next_offset = update_id + 1
+
+    # persist_telegram_metadata re-reads/merges immediately before writing so a
+    # concurrent writer's subscriber change is not clobbered.
     save_telegram_metadata(
         config["state_file"],
         config,
-        state["telegram_update_offset"],
+        next_offset,
         subscribed_chats,
         state["last_status_at"],
+        previous_chats,
     )
+    if error:
+        raise RuntimeError(error)
     return stats
+
+
+def owner_alert_succeeded(config: dict[str, Any], result: AlertResult) -> bool:
+    """Did the alert reach the OWNER (configured default chat)?
+
+    The owner is the gate for recording a newly-opened date as known. When no
+    owner chat is configured the send goes through the dry-run path; treat that
+    as success unless the dry-run itself failed.
+    """
+    owner = str(config["telegram_chat_id"]) if config["telegram_chat_id"] else ""
+    if not owner or not config["telegram_bot_token"]:
+        return not result.dry_run_failed
+    return owner not in result.failed
 
 
 def cycle() -> dict[str, str]:
     config = get_config()
+    warn_if_ephemeral_state(config)
     current = run_once()
     current_dates = set(current)
     state = read_state(config["state_file"], config)
     previous_dates = set(state["open_dates"])
+    previous_alts = dict(state.get("open_day_alts") or {})
     telegram_update_offset = state["telegram_update_offset"]
-    subscribed_chats = set(state["subscribed_chats"])
+    previous_chats = set(state["subscribed_chats"])
+    subscribed_chats = set(previous_chats)
     last_status_at = state["last_status_at"]
     new_dates = sorted(current_dates - previous_dates)
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat(timespec="seconds")
     send_errors: list[str] = []
+    terminal_chats: set[str] = set()
+
+    # Baseline of known open-dates we will persist. Start from dates that were
+    # already known previously AND are still open (they stay known). Newly-opened
+    # dates are added only after the owner alert for them succeeds (fix 2).
+    persisted_alts: dict[str, str] = {
+        date_key: str(current.get(date_key, previous_alts.get(date_key, "")))
+        for date_key in (previous_dates & current_dates)
+    }
 
     try:
         telegram_update_offset, subscribed_chats, command_errors, command_stats = process_telegram_commands(
@@ -1087,23 +1439,46 @@ def cycle() -> dict[str, str]:
 
         if new_dates:
             message = build_alert_message(new_dates, current, config)
-            alert_errors = send_to_alert_targets(message, config, alert_targets)
-            if alert_errors:
-                for error in alert_errors:
-                    send_errors.append(f"alert: {error}")
-                    print(f"[error] Telegram alert send failed: {error}", file=sys.stderr)
-            else:
+            result = send_to_alert_targets(message, config, alert_targets)
+            terminal_chats |= result.terminal
+            for error in result.errors:
+                send_errors.append(f"alert: {error}")
+                print(f"[error] Telegram alert send failed: {error}", file=sys.stderr)
+            # Only record the newly-opened dates as known once the OWNER alert
+            # actually succeeded; otherwise leave them out so they retry next
+            # cycle instead of being silently lost.
+            if owner_alert_succeeded(config, result):
+                for date_key in new_dates:
+                    persisted_alts[date_key] = str(current[date_key])
                 last_status_at = now_iso
         elif should_send_status(last_status_at, int(config["status_interval_seconds"]), now):
-            status_errors = send_to_alert_targets(build_status_message(current, config), config, alert_targets)
-            if status_errors:
-                for error in status_errors:
-                    send_errors.append(f"status: {error}")
-                    print(f"[error] Telegram status send failed: {error}", file=sys.stderr)
-            else:
-                last_status_at = now_iso
+            result = send_to_alert_targets(build_status_message(current, config), config, alert_targets)
+            terminal_chats |= result.terminal
+            for error in result.errors:
+                send_errors.append(f"status: {error}")
+                print(f"[error] Telegram status send failed: {error}", file=sys.stderr)
+            # last_status_at advances on ATTEMPT so one dead chat cannot trigger
+            # minute-by-minute re-broadcasts to everyone else (fix 3).
+            last_status_at = now_iso
+
+        # Prune permanently-dead chats so they are not retried forever (fix 3).
+        if terminal_chats:
+            subscribed_chats -= terminal_chats
+            for chat_id in sorted(terminal_chats):
+                print(f"[telegram] dropping dead subscriber {chat_id}", file=sys.stderr)
     finally:
-        save_state(config["state_file"], current, telegram_update_offset, subscribed_chats, config, last_status_at)
+        # Open-dates state is owned by this scan; persist it directly. Telegram
+        # sub-state is merged against a fresh read so we never clobber a
+        # concurrent subscribe/unsubscribe (fix 17).
+        save_state(config["state_file"], persisted_alts, telegram_update_offset, previous_chats, config, last_status_at)
+        save_telegram_metadata(
+            config["state_file"],
+            config,
+            telegram_update_offset,
+            subscribed_chats,
+            last_status_at,
+            previous_chats,
+        )
 
     print(
         f"[summary] open={len(current_dates)} new={len(new_dates)} "
@@ -1111,7 +1486,15 @@ def cycle() -> dict[str, str]:
         flush=True,
     )
     if send_errors:
-        raise RuntimeError("; ".join(send_errors))
+        # Command-handling errors are surfaced for visibility, but per-chat send
+        # failures must NOT crash the cycle (fix 3). Only raise when something
+        # other than a tolerated per-chat send failure occurred.
+        unexpected = [
+            err for err in send_errors
+            if not (err.startswith("alert: chat ") or err.startswith("status: chat "))
+        ]
+        if unexpected:
+            raise RuntimeError("; ".join(unexpected))
     return current
 
 

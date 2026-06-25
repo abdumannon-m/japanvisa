@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 import sys
@@ -44,8 +45,13 @@ async def send_json(send, status: int, payload: dict) -> None:
 
 async def handle_check(scope, send) -> None:
     secret = os.environ.get("CRON_SECRET", "").strip()
-    auth = header_value(scope.get("headers", []), "authorization")
-    if secret and auth != f"Bearer {secret}":
+    # Fail CLOSED: refuse to run unauthenticated when the secret is not set.
+    if not secret:
+        print("[error] CRON_SECRET is not configured; refusing to run /check", file=sys.stderr)
+        await send_json(send, 503, {"ok": False, "error": "service unavailable"})
+        return
+    auth = header_value(scope.get("headers", []), "authorization") or ""
+    if not hmac.compare_digest(auth, f"Bearer {secret}"):
         await send_json(send, 401, {"error": "unauthorized"})
         return
 
@@ -53,7 +59,9 @@ async def handle_check(scope, send) -> None:
         current = cycle()
         await send_json(send, 200, {"ok": True, "open": sorted(current)})
     except Exception as exc:
-        await send_json(send, 500, {"ok": False, "error": str(exc)})
+        # Do not reflect internal exception text to clients.
+        print(f"[error] /check failed: {exc}", file=sys.stderr)
+        await send_json(send, 500, {"ok": False, "error": "internal error"})
 
 
 async def handle_telegram(scope, receive, send) -> None:
@@ -65,21 +73,37 @@ async def handle_telegram(scope, receive, send) -> None:
         return
 
     secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    token = header_value(scope.get("headers", []), "x-telegram-bot-api-secret-token")
-    if secret and token != secret:
+    # Fail CLOSED: refuse to run unauthenticated when the secret is not set.
+    if not secret:
+        print("[error] TELEGRAM_WEBHOOK_SECRET is not configured; refusing webhook", file=sys.stderr)
+        await send_json(send, 503, {"ok": False, "error": "service unavailable"})
+        return
+    token = header_value(scope.get("headers", []), "x-telegram-bot-api-secret-token") or ""
+    if not hmac.compare_digest(token, secret):
         await send_json(send, 401, {"error": "unauthorized"})
         return
 
+    # Parse the body first; an unparseable body is a real 400.
     try:
         update = json.loads((await read_body(receive)).decode("utf-8"))
-        stats = handle_telegram_webhook_update(update)
-        await send_json(send, 200, {"ok": True, **stats})
     except Exception as exc:
-        await send_json(send, 500, {"ok": False, "error": str(exc)})
+        print(f"[error] telegram webhook: unparseable body: {exc}", file=sys.stderr)
+        await send_json(send, 400, {"ok": False, "error": "bad request"})
+        return
+
+    # ACK fast: always 200 once parsed, even if internal handling raised, so
+    # Telegram does not redeliver the same update for ~24h. Log errors instead.
+    stats: dict = {}
+    try:
+        stats = handle_telegram_webhook_update(update)
+    except Exception as exc:
+        print(f"[error] telegram webhook handling failed: {exc}", file=sys.stderr)
+    await send_json(send, 200, {"ok": True, **stats})
 
 
 async def handle_health(send) -> None:
     config = get_config()
+    # Do not disclose which protective secrets / state backends are configured.
     await send_json(
         send,
         200,
@@ -90,13 +114,6 @@ async def handle_health(send) -> None:
             "plan_id": config["plan_id"],
             "months_ahead": config["months_ahead"],
             "status_interval_seconds": config["status_interval_seconds"],
-            "telegram_bot_configured": bool(config["telegram_bot_token"]),
-            "telegram_webhook_configured": bool(config["telegram_webhook_secret"]),
-            "telegram_default_chat_configured": bool(config["telegram_chat_id"]),
-            "upstash_configured": upstash_enabled(config),
-            "supabase_configured": supabase_enabled(config),
-            "state_backend": state_label(config),
-            "cron_secret_configured": bool(os.environ.get("CRON_SECRET")),
         },
     )
 
