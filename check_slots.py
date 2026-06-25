@@ -607,6 +607,26 @@ def build_alert_message(date_keys: list[str], current: dict[str, str], config: d
     return "\n".join(lines)
 
 
+def build_test_alert_message(config: dict[str, Any]) -> str:
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    label = html.escape(str(config["event_label"]))
+    escaped_url = html.escape(configured_booking_url(config), quote=True)
+    return "\n".join(
+        [
+            "<b>Japan visa test alert</b>",
+            label,
+            "",
+            "TEST ONLY: no real visa slot is being reported.",
+            "",
+            "<b>Simulated newly opened date</b>",
+            "- <b>2099-01-01</b>: TEST ONLY",
+            "",
+            f"Book: <a href=\"{escaped_url}\">reservation calendar</a>",
+            f"Checked: {timestamp} UTC",
+        ]
+    )
+
+
 def build_status_message(current: dict[str, str], config: dict[str, Any]) -> str:
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     label = html.escape(str(config["event_label"]))
@@ -637,6 +657,7 @@ def build_help_message(current: dict[str, str], config: dict[str, Any]) -> str:
     return (
         "Send /status to check current Japan visa slots.\n"
         "Send /subscribe to receive newly opened slot alerts.\n"
+        "Send /testalert to verify Telegram alert delivery.\n"
         "Send /unsubscribe to stop alerts.\n\n"
         + build_status_message(current, config)
     )
@@ -703,11 +724,13 @@ def handle_telegram_message(
         subscribed_chats.add(chat_id)
         reply = "Subscribed. You will receive newly opened Japan visa slot alerts.\n\n"
         reply += build_status_message(current, config)
+    elif command == "/testalert":
+        reply = build_test_alert_message(config)
     elif command == "/unsubscribe":
         subscribed_chats.discard(chat_id)
         reply = "Unsubscribed. Send /subscribe any time to receive alerts again."
     elif command.startswith("/"):
-        reply = "Supported commands: /status, /subscribe, /unsubscribe"
+        reply = "Supported commands: /status, /subscribe, /testalert, /unsubscribe"
     else:
         return subscribed_chats, False, False, None
 

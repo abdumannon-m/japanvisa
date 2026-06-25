@@ -30,10 +30,12 @@ Anyone can open your Telegram bot and send:
 /start
 /status
 /subscribe
+/testalert
 /unsubscribe
 ```
 
 `/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in state so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
+`/testalert` sends a clearly marked simulated alert only to the chat that requested it. Use it after `/subscribe` to prove Telegram alert delivery without waiting for a real slot.
 
 Simple production mode uses GitHub Actions polling. It needs only `TELEGRAM_BOT_TOKEN`, checks every 60 seconds, answers commands, and sends subscribed users hourly status updates or immediate new-slot alerts. If a stale Telegram webhook exists, polling mode deletes it automatically and retries.
 
@@ -110,7 +112,7 @@ GitHub Actions remains a useful backup host. The included workflow starts on a 1
 The repo also includes a Vercel Python entrypoint at `api/index.py` with three optional routes:
 
 - `/api/check`: protected cron endpoint. It checks slots every minute on Vercel Pro production deployments.
-- `/api/telegram`: Telegram webhook endpoint. It answers `/status`, `/subscribe`, and `/unsubscribe` immediately.
+- `/api/telegram`: Telegram webhook endpoint. It answers `/status`, `/subscribe`, `/testalert`, and `/unsubscribe` immediately.
 - `/api/health`: non-secret deployment health endpoint. It reports whether Telegram, Supabase, webhook, and cron secrets are configured.
 
 For Vercel to send Telegram messages and remember subscribers, it needs a durable state backend such as Supabase or another database. If you do not have a database available, use the GitHub Actions polling mode above.
