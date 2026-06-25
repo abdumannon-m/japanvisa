@@ -8,6 +8,7 @@ import getpass
 import json
 import secrets
 import subprocess
+import time
 from urllib.parse import urlparse
 
 from set_telegram_webhook import set_webhook
@@ -71,12 +72,20 @@ def set_vercel_env(name: str, value: str, scope: str, sensitive: bool = True) ->
 
 def set_github_secret(name: str, value: str, repo: str) -> None:
     print(f"Setting GitHub secret {name}")
-    subprocess.run(
-        ["gh", "secret", "set", name, "--repo", repo],
-        input=value,
-        text=True,
-        check=True,
-    )
+    command = ["gh", "secret", "set", name, "--repo", repo]
+    for attempt in range(1, 4):
+        result = subprocess.run(
+            command,
+            input=value,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode == 0:
+            return
+        if attempt == 3:
+            raise RuntimeError(f"Could not set GitHub secret {name}: {result.stdout.strip()}")
+        time.sleep(2 * attempt)
 
 
 def deploy(scope: str) -> str | None:
