@@ -64,7 +64,7 @@ async def handle_telegram(scope, receive, send) -> None:
         await send_json(send, 405, {"ok": False, "error": "method not allowed"})
         return
 
-    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
     token = header_value(scope.get("headers", []), "x-telegram-bot-api-secret-token")
     if secret and token != secret:
         await send_json(send, 401, {"error": "unauthorized"})

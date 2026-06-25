@@ -1011,13 +1011,17 @@ def poll_telegram_commands_once(current: dict[str, str], config: dict[str, Any])
     )
 
 
+def current_from_state(state: dict[str, Any]) -> dict[str, str]:
+    return {str(date_key): "Available" for date_key in sorted(state["open_dates"])}
+
+
 def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
     config = get_config()
     if not config["telegram_bot_token"]:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required for Telegram webhook replies")
 
-    current = run_once()
     state = read_state(config["state_file"], config)
+    current = current_from_state(state)
     subscribed_chats = set(state["subscribed_chats"])
     message = update.get("message")
     stats = {"commands": 0, "replies": 0}
