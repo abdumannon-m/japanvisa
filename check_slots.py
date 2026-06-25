@@ -322,7 +322,8 @@ class CalendarCellParser(HTMLParser):
             return
         if tag == "img" and self.stack:
             alt = attr_map.get("alt")
-            if alt:
+            src = attr_map.get("src") or ""
+            if alt and "icon_disabled" not in src:
                 self.cells[self.stack[-1][1]]["alts"].append(alt)
 
     def handle_data(self, data: str) -> None:
