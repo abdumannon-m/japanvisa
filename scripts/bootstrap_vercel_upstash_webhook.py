@@ -66,14 +66,14 @@ def set_vercel_env(name: str, value: str, scope: str, sensitive: bool = True) ->
         cmd.append("--no-sensitive")
 
     print(f"Setting Vercel env {name}")
-    subprocess.run(cmd, input=value + "\n", text=True, check=True)
+    subprocess.run(cmd, input=value, text=True, check=True)
 
 
 def set_github_secret(name: str, value: str, repo: str) -> None:
     print(f"Setting GitHub secret {name}")
     subprocess.run(
         ["gh", "secret", "set", name, "--repo", repo],
-        input=value + "\n",
+        input=value,
         text=True,
         check=True,
     )
