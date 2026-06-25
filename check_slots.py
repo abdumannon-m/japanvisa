@@ -833,22 +833,26 @@ def run_once() -> dict[str, str]:
 
 
 def build_alert_message(date_keys: list[str], current: dict[str, str], config: dict[str, Any]) -> str:
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     label = html.escape(str(config["event_label"]))
     escaped_url = html.escape(configured_booking_url(config), quote=True)
+    count = len(date_keys)
+    headline = "JAPAN VISA SLOT OPEN" if count == 1 else f"{count} JAPAN VISA SLOTS OPEN"
     lines = [
-        "<b>Japan visa slots open</b>",
-        label,
+        f"🚨🚨 <b>{headline}</b> 🚨🚨",
         "",
-        "<b>Newly opened dates</b>",
+        f"📋 {label}",
+        "",
+        "🗓 <b>Newly available — book now:</b>",
     ]
     for date_key in date_keys:
-        lines.append(f"- <b>{html.escape(date_key)}</b>: {html.escape(current[date_key])}")
+        lines.append(f"   ✅ <b>{html.escape(date_key)}</b> — {html.escape(current[date_key])}")
     lines.extend(
         [
             "",
-            f"Book: <a href=\"{escaped_url}\">reservation calendar</a>",
-            f"Checked: {timestamp} UTC",
+            f"⚡️ <a href=\"{escaped_url}\"><b>OPEN BOOKING CALENDAR</b></a>",
+            "",
+            f"🕒 <i>Detected {timestamp}</i>",
         ]
     )
     return "\n".join(lines)
@@ -860,16 +864,19 @@ def build_test_alert_message(config: dict[str, Any]) -> str:
     escaped_url = html.escape(configured_booking_url(config), quote=True)
     return "\n".join(
         [
-            "<b>Japan visa test alert</b>",
-            label,
+            "🧪 <b>TEST ALERT — not a real slot</b>",
             "",
-            "TEST ONLY: no real visa slot is being reported.",
+            "🚨🚨 <b>JAPAN VISA SLOT OPEN</b> 🚨🚨",
             "",
-            "<b>Simulated newly opened date</b>",
-            "- <b>2099-01-01</b>: TEST ONLY",
+            f"📋 {label}",
             "",
-            f"Book: <a href=\"{escaped_url}\">reservation calendar</a>",
-            f"Checked: {timestamp} UTC",
+            "🗓 <b>Newly available — book now:</b>",
+            "   ✅ <b>2099-01-01</b> — TEST ONLY",
+            "",
+            f"⚡️ <a href=\"{escaped_url}\"><b>OPEN BOOKING CALENDAR</b></a>",
+            "",
+            "🧪 <i>This is only a delivery test.</i>",
+            f"🕒 <i>{timestamp}</i>",
         ]
     )
 
