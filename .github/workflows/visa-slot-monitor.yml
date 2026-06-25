@@ -2,7 +2,7 @@ name: Visa Slot Monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -46,4 +46,14 @@ jobs:
           MONTHS_AHEAD: "2"
           EVENT_LABEL: "Short stay - Applicant"
           STATUS_INTERVAL_SECONDS: "3600"
-        run: python check_slots.py
+          LOOP_SECONDS: "60"
+          LOOP_DURATION_SECONDS: "21000"
+        run: |
+          set +e
+          timeout "${LOOP_DURATION_SECONDS}s" python check_slots.py --loop "$LOOP_SECONDS"
+          code=$?
+          if [ "$code" -eq 124 ]; then
+            echo "Monitor loop reached planned duration"
+            exit 0
+          fi
+          exit "$code"

@@ -35,7 +35,7 @@ Anyone can open your Telegram bot and send:
 
 `/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in state so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
 
-On Vercel, `/api/telegram` can receive Telegram webhooks so commands respond immediately. On GitHub Actions, commands are answered only when a workflow run starts. GitHub scheduled runs can be delayed or skipped, so this is not a true 24/7 bot runtime. For reliable minute-level checks, use Vercel Pro cron or run the bot continuously on a VPS with `python check_slots.py --loop 60`.
+On Vercel, `/api/telegram` can receive Telegram webhooks so commands respond immediately. GitHub Actions is configured as a backup long-running watcher: each scheduled run checks every 60 seconds for about 5 hours and 50 minutes, then exits cleanly so a pending scheduled run can take over. GitHub scheduling can still lag or skip, so Vercel Pro cron plus Telegram webhook remains the preferred production runtime.
 
 ## Local Use
 
@@ -102,7 +102,7 @@ python check_slots.py --loop 60
 
 as a `systemd` service. The monitor no longer needs Playwright or Chromium, so it has a small Python/requests footprint and is suitable for a free-tier VM.
 
-GitHub Actions remains a useful backup host. It runs from the included workflow every 5 minutes, but GitHub cron can lag or skip under load, and command replies are only processed when a workflow run starts.
+GitHub Actions remains a useful backup host. The included workflow starts on a 15-minute schedule, then keeps checking every 60 seconds for about 5 hours and 50 minutes. The repository concurrency setting allows only one active monitor and one pending replacement run, so it behaves like a near-continuous backup loop instead of a one-shot cron. GitHub scheduling can still lag or skip under load.
 
 ## Vercel Pro
 
@@ -152,4 +152,4 @@ Without Supabase env vars, the monitor writes currently open dates, Telegram upd
 
 ## Limitations
 
-GitHub cron has roughly 5-minute granularity and can lag or skip under load. For second-level speed, run `python check_slots.py --loop 60` on a VPS. Scheduled workflows can pause after 60 days of repository inactivity.
+GitHub scheduled workflows can lag or skip under load. For second-level speed, run `python check_slots.py --loop 60` on a VPS. Scheduled workflows can pause after 60 days of repository inactivity.
