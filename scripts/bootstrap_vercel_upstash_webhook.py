@@ -101,16 +101,18 @@ def deploy(scope: str) -> str | None:
     )
     print(result.stdout)
 
+    aliased_url: str | None = None
+    production_url: str | None = None
     for line in result.stdout.splitlines():
         if line.startswith("Aliased: "):
             match = URL_RE.search(line)
             if match:
-                return require_https_url(match.group(0), "Aliased deployment URL")
+                aliased_url = require_https_url(match.group(0), "Aliased deployment URL")
         if line.startswith("Production: "):
             match = URL_RE.search(line)
             if match:
-                return require_https_url(match.group(0), "Production deployment URL")
-    return None
+                production_url = require_https_url(match.group(0), "Production deployment URL")
+    return aliased_url or production_url
 
 
 def main() -> int:
