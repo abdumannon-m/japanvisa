@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import secrets
 import subprocess
 from urllib.parse import urlparse
@@ -29,6 +30,24 @@ def prompt_secret(label: str) -> str:
     if not value:
         raise SystemExit(f"{label} is required")
     return value
+
+
+def get_upstash_rest_credentials(database_id: str) -> tuple[str, str]:
+    result = subprocess.run(
+        ["upstash", "redis", "get", f"--id={database_id}", "--json"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    endpoint = payload.get("endpoint")
+    rest_token = payload.get("rest_token")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise SystemExit("Upstash database response did not include endpoint")
+    if not isinstance(rest_token, str) or not rest_token:
+        raise SystemExit("Upstash database response did not include rest_token")
+    return f"https://{endpoint}", rest_token
 
 
 def set_vercel_env(name: str, value: str, scope: str, sensitive: bool = True) -> None:
@@ -83,6 +102,10 @@ def main() -> int:
     parser.add_argument("--url", default=DEFAULT_URL, help="Production Vercel URL to register with Telegram")
     parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repository for backup workflow secrets")
     parser.add_argument(
+        "--upstash-db-id",
+        help="Existing Upstash Redis database id. When set, REST credentials are read from Upstash CLI.",
+    )
+    parser.add_argument(
         "--skip-github-secrets",
         action="store_true",
         help="Do not write secrets to GitHub Actions",
@@ -91,8 +114,11 @@ def main() -> int:
 
     production_url = require_https_url(args.url, "Production URL")
     token = prompt_secret("Telegram bot token")
-    upstash_url = require_https_url(input("Upstash Redis REST URL: ").strip(), "Upstash Redis REST URL")
-    upstash_token = prompt_secret("Upstash Redis REST token")
+    if args.upstash_db_id:
+        upstash_url, upstash_token = get_upstash_rest_credentials(args.upstash_db_id)
+    else:
+        upstash_url = require_https_url(input("Upstash Redis REST URL: ").strip(), "Upstash Redis REST URL")
+        upstash_token = prompt_secret("Upstash Redis REST token")
     chat_id = input("Optional default Telegram chat id/channel (blank to skip): ").strip()
     webhook_secret = secrets.token_urlsafe(32)
     cron_secret = secrets.token_urlsafe(32)
