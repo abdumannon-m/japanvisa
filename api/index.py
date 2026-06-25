@@ -43,7 +43,7 @@ async def send_json(send, status: int, payload: dict) -> None:
 
 
 async def handle_check(scope, send) -> None:
-    secret = os.environ.get("CRON_SECRET")
+    secret = os.environ.get("CRON_SECRET", "").strip()
     auth = header_value(scope.get("headers", []), "authorization")
     if secret and auth != f"Bearer {secret}":
         await send_json(send, 401, {"error": "unauthorized"})

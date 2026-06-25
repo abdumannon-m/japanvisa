@@ -47,8 +47,12 @@ POS = [
 ]
 
 
+def env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
 def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = env_str(name)
     if not raw:
         return default
     try:
@@ -59,24 +63,24 @@ def env_int(name: str, default: int) -> int:
 
 
 def get_config() -> dict[str, Any]:
-    event_id = os.getenv("EVENT_ID", "20")
+    event_id = env_str("EVENT_ID", "20")
     return {
         "event_id": event_id,
-        "category_id": os.getenv("CATEGORY_ID", "12"),
-        "plan_id": os.getenv("PLAN_ID", "19"),
+        "category_id": env_str("CATEGORY_ID", "12"),
+        "plan_id": env_str("PLAN_ID", "19"),
         "months_ahead": env_int("MONTHS_AHEAD", 2),
-        "event_label": os.getenv("EVENT_LABEL", "Short stay - Applicant"),
-        "month_param": os.getenv("MONTH_PARAM", "date"),
+        "event_label": env_str("EVENT_LABEL", "Short stay - Applicant"),
+        "month_param": env_str("MONTH_PARAM", "date"),
         "status_interval_seconds": env_int("STATUS_INTERVAL_SECONDS", 3600),
-        "state_file": Path(os.getenv("STATE_FILE", "state.json")),
-        "state_key": os.getenv("STATE_KEY", f"event-{event_id}"),
-        "supabase_url": os.getenv("SUPABASE_URL", "").rstrip("/"),
-        "supabase_service_key": os.getenv("SUPABASE_SERVICE_KEY", ""),
-        "upstash_redis_rest_url": os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/"),
-        "upstash_redis_rest_token": os.getenv("UPSTASH_REDIS_REST_TOKEN", ""),
-        "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
-        "telegram_webhook_secret": os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
+        "state_file": Path(env_str("STATE_FILE", "state.json")),
+        "state_key": env_str("STATE_KEY", f"event-{event_id}"),
+        "supabase_url": env_str("SUPABASE_URL").rstrip("/"),
+        "supabase_service_key": env_str("SUPABASE_SERVICE_KEY"),
+        "upstash_redis_rest_url": env_str("UPSTASH_REDIS_REST_URL").rstrip("/"),
+        "upstash_redis_rest_token": env_str("UPSTASH_REDIS_REST_TOKEN"),
+        "telegram_bot_token": env_str("TELEGRAM_BOT_TOKEN"),
+        "telegram_chat_id": env_str("TELEGRAM_CHAT_ID"),
+        "telegram_webhook_secret": env_str("TELEGRAM_WEBHOOK_SECRET"),
     }
 
 
