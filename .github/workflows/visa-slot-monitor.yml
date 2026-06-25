@@ -48,10 +48,11 @@ jobs:
           EVENT_LABEL: "Short stay - Applicant"
           STATUS_INTERVAL_SECONDS: "3600"
           LOOP_SECONDS: "60"
+          TELEGRAM_POLL_INTERVAL_SECONDS: "5"
           LOOP_DURATION_SECONDS: "21000"
         run: |
           set +e
-          timeout "${LOOP_DURATION_SECONDS}s" python check_slots.py --loop "$LOOP_SECONDS"
+          timeout "${LOOP_DURATION_SECONDS}s" python check_slots.py --loop "$LOOP_SECONDS" --telegram-poll-interval "$TELEGRAM_POLL_INTERVAL_SECONDS"
           code=$?
           if [ "$code" -eq 124 ]; then
             echo "Monitor loop reached planned duration"

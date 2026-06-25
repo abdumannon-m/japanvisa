@@ -37,7 +37,7 @@ Anyone can open your Telegram bot and send:
 `/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in state so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
 `/testalert` sends a clearly marked simulated alert only to the chat that requested it. Use it after `/subscribe` to prove Telegram alert delivery without waiting for a real slot.
 
-Simple production mode uses GitHub Actions polling. It needs only `TELEGRAM_BOT_TOKEN`, checks every 60 seconds, answers commands, and sends subscribed users hourly status updates or immediate new-slot alerts. If a stale Telegram webhook exists, polling mode deletes it automatically and retries.
+Simple production mode uses GitHub Actions polling. It needs only `TELEGRAM_BOT_TOKEN`, checks slots every 60 seconds, polls Telegram commands every 5 seconds between slot checks, and sends subscribed users hourly status updates or immediate new-slot alerts. If a stale Telegram webhook exists, polling mode deletes it automatically and retries.
 
 ## Local Use
 
@@ -53,10 +53,10 @@ Run one check:
 python check_slots.py
 ```
 
-Run continuously, checking every 60 seconds:
+Run continuously, checking slots every 60 seconds and Telegram commands every 5 seconds:
 
 ```sh
-python check_slots.py --loop 60
+python check_slots.py --loop 60 --telegram-poll-interval 5
 ```
 
 If `TELEGRAM_BOT_TOKEN` is missing, the script cannot answer public commands. If `TELEGRAM_CHAT_ID` is missing, broadcast alerts to a fixed chat are disabled, but `/status` and `/subscribe` still work when the bot token is configured.
@@ -78,6 +78,7 @@ STATE_KEY=event-20
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID= optional default alert target
 TELEGRAM_WEBHOOK_SECRET= optional webhook secret token
+TELEGRAM_POLL_INTERVAL_SECONDS=5
 SUPABASE_URL=
 SUPABASE_SERVICE_KEY=
 CRON_SECRET= only for Vercel /api/check
@@ -100,12 +101,12 @@ It prints the seeded cookie status, the raw AJAX response, parsed month/icon cou
 Recommended always-on host: **GCP free-tier e2-micro** in `us-west1`, `us-central1`, or `us-east1`, running:
 
 ```sh
-python check_slots.py --loop 60
+python check_slots.py --loop 60 --telegram-poll-interval 5
 ```
 
 as a `systemd` service. The monitor no longer needs Playwright or Chromium, so it has a small Python/requests footprint and is suitable for a free-tier VM.
 
-GitHub Actions remains a useful backup host. The included workflow starts on a 15-minute schedule, then keeps checking every 60 seconds for about 5 hours and 50 minutes. The repository concurrency setting allows only one active monitor and one pending replacement run, so it behaves like a near-continuous backup loop instead of a one-shot cron. GitHub scheduling can still lag or skip under load.
+GitHub Actions remains a useful backup host. The included workflow starts on a 15-minute schedule, then keeps checking slots every 60 seconds and Telegram commands every 5 seconds for about 5 hours and 50 minutes. The repository concurrency setting allows only one active monitor and one pending replacement run, so it behaves like a near-continuous backup loop instead of a one-shot cron. GitHub scheduling can still lag or skip under load.
 
 ## Optional Vercel Pro
 
@@ -155,4 +156,4 @@ Without Supabase env vars, the monitor writes currently open dates, Telegram upd
 
 ## Limitations
 
-GitHub scheduled workflows can lag or skip under load. For second-level speed, run `python check_slots.py --loop 60` on a VPS. Scheduled workflows can pause after 60 days of repository inactivity.
+GitHub scheduled workflows can lag or skip under load. For second-level command speed, run `python check_slots.py --loop 60 --telegram-poll-interval 5` on a VPS. Scheduled workflows can pause after 60 days of repository inactivity.

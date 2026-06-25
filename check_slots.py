@@ -890,6 +890,34 @@ def save_telegram_metadata(
     )
 
 
+def poll_telegram_commands_once(current: dict[str, str], config: dict[str, Any]) -> None:
+    state = read_state(config["state_file"], config)
+    telegram_update_offset, subscribed_chats, command_errors, command_stats = process_telegram_commands(
+        current,
+        config,
+        state["telegram_update_offset"],
+        set(state["subscribed_chats"]),
+    )
+    if command_stats["updates"] or command_stats["commands"] or command_stats["replies"]:
+        print(
+            "[telegram-fast] "
+            f"updates={command_stats['updates']} "
+            f"commands={command_stats['commands']} "
+            f"replies={command_stats['replies']}",
+            flush=True,
+        )
+    for error in command_errors:
+        print(f"[error] Telegram command failed: {error}", file=sys.stderr)
+
+    save_telegram_metadata(
+        config["state_file"],
+        config,
+        telegram_update_offset,
+        subscribed_chats,
+        state["last_status_at"],
+    )
+
+
 def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
     config = get_config()
     if not config["telegram_bot_token"]:
@@ -1003,6 +1031,13 @@ def main() -> int:
         metavar="SECONDS",
         help="Run continuously and sleep SECONDS between checks.",
     )
+    parser.add_argument(
+        "--telegram-poll-interval",
+        type=int,
+        default=env_int("TELEGRAM_POLL_INTERVAL_SECONDS", 5),
+        metavar="SECONDS",
+        help="Poll Telegram commands this often between slot checks.",
+    )
     args = parser.parse_args()
 
     if args.probe:
@@ -1015,13 +1050,28 @@ def main() -> int:
 
     if args.loop <= 0:
         parser.error("--loop must be a positive number of seconds")
+    if args.telegram_poll_interval <= 0:
+        parser.error("--telegram-poll-interval must be a positive number of seconds")
 
+    current: dict[str, str] = {}
     while True:
         try:
-            cycle()
+            current = cycle()
         except Exception as exc:
             print(f"[error] {datetime.now(timezone.utc).isoformat(timespec='seconds')} {exc}", file=sys.stderr)
-        time.sleep(args.loop)
+
+        deadline = time.monotonic() + args.loop
+        while time.monotonic() < deadline:
+            time.sleep(min(args.telegram_poll_interval, max(0.0, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                break
+            try:
+                poll_telegram_commands_once(current, get_config())
+            except Exception as exc:
+                print(
+                    f"[error] {datetime.now(timezone.utc).isoformat(timespec='seconds')} telegram poll: {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
