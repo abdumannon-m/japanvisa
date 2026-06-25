@@ -761,7 +761,15 @@ def get_telegram_updates(token: str, offset: int | None) -> list[dict[str, Any]]
     }
     if offset is not None:
         params["offset"] = str(offset)
-    payload = telegram_request(token, "getUpdates", params)
+    try:
+        payload = telegram_request(token, "getUpdates", params)
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "webhook" not in message or "getupdates" not in message:
+            raise
+        telegram_request(token, "deleteWebhook", {"drop_pending_updates": "false"})
+        print("[telegram] deleted stale webhook; retrying getUpdates", flush=True)
+        payload = telegram_request(token, "getUpdates", params)
     result = payload.get("result", [])
     return result if isinstance(result, list) else []
 

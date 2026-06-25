@@ -35,7 +35,7 @@ Anyone can open your Telegram bot and send:
 
 `/status` returns the currently open Japan visa dates. `/subscribe` stores that chat in state so the bot sends newly opened slot alerts to that user or group. This is not bound to a single `TELEGRAM_CHAT_ID`.
 
-On Vercel, `/api/telegram` can receive Telegram webhooks so commands respond immediately. GitHub Actions is configured as a backup long-running watcher: each scheduled run checks every 60 seconds for about 5 hours and 50 minutes, then exits cleanly so a pending scheduled run can take over. GitHub scheduling can still lag or skip, so Vercel Pro cron plus Telegram webhook remains the preferred production runtime.
+Simple production mode uses GitHub Actions polling. It needs only `TELEGRAM_BOT_TOKEN`, checks every 60 seconds, answers commands, and sends subscribed users hourly status updates or immediate new-slot alerts. If a stale Telegram webhook exists, polling mode deletes it automatically and retries.
 
 ## Local Use
 
@@ -104,15 +104,15 @@ as a `systemd` service. The monitor no longer needs Playwright or Chromium, so i
 
 GitHub Actions remains a useful backup host. The included workflow starts on a 15-minute schedule, then keeps checking every 60 seconds for about 5 hours and 50 minutes. The repository concurrency setting allows only one active monitor and one pending replacement run, so it behaves like a near-continuous backup loop instead of a one-shot cron. GitHub scheduling can still lag or skip under load.
 
-## Vercel Pro
+## Optional Vercel Pro
 
-The repo includes a Vercel Python entrypoint at `api/index.py` with two routes:
+The repo also includes a Vercel Python entrypoint at `api/index.py` with three optional routes:
 
 - `/api/check`: protected cron endpoint. It checks slots every minute on Vercel Pro production deployments.
 - `/api/telegram`: Telegram webhook endpoint. It answers `/status`, `/subscribe`, and `/unsubscribe` immediately.
 - `/api/health`: non-secret deployment health endpoint. It reports whether Telegram, Supabase, webhook, and cron secrets are configured.
 
-New slot alerts are sent immediately on the next cron tick. If nothing changes, a status message is sent after `STATUS_INTERVAL_SECONDS` seconds.
+For Vercel to send Telegram messages and remember subscribers, it needs a durable state backend such as Supabase or another database. If you do not have a database available, use the GitHub Actions polling mode above.
 
 The Vercel function is protected by `CRON_SECRET`: cron invocations include `Authorization: Bearer $CRON_SECRET`, and other requests are rejected when the secret is configured.
 
