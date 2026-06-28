@@ -85,6 +85,9 @@ def env_int(
 def get_config() -> dict[str, Any]:
     event_id = env_str("EVENT_ID", "20")
     telegram_chat_id = env_str("TELEGRAM_CHAT_ID")
+    # TELEGRAM_CHAT_ID may be a comma-separated list of fixed recipients who
+    # always receive alerts (in addition to anyone who /subscribes).
+    telegram_chat_ids = [part.strip() for part in telegram_chat_id.split(",") if part.strip()]
     return {
         "event_id": event_id,
         "category_id": env_str("CATEGORY_ID", "12"),
@@ -101,6 +104,7 @@ def get_config() -> dict[str, Any]:
         "upstash_redis_rest_token": env_str("UPSTASH_REDIS_REST_TOKEN"),
         "telegram_bot_token": env_str("TELEGRAM_BOT_TOKEN"),
         "telegram_chat_id": telegram_chat_id,
+        "telegram_chat_ids": telegram_chat_ids,
         "telegram_webhook_secret": env_str("TELEGRAM_WEBHOOK_SECRET"),
     }
 
@@ -1123,12 +1127,13 @@ def send_telegram_to_chat(token: str, chat_id: str, message: str) -> None:
 
 def send_telegram(message: str, config: dict[str, Any]) -> None:
     token = config["telegram_bot_token"]
-    chat_id = config["telegram_chat_id"]
-    if not token or not chat_id:
+    chat_ids = config["telegram_chat_ids"]
+    if not token or not chat_ids:
         print("[dry-run] Telegram credentials missing; message would be:")
         print(message)
         return
-    send_telegram_to_chat(token, chat_id, message)
+    for chat_id in chat_ids:
+        send_telegram_to_chat(token, str(chat_id), message)
 
 
 def get_telegram_updates(token: str, offset: int | None) -> list[dict[str, Any]]:
@@ -1386,16 +1391,19 @@ def handle_telegram_webhook_update(update: dict[str, Any]) -> dict[str, int]:
 
 
 def owner_alert_succeeded(config: dict[str, Any], result: AlertResult) -> bool:
-    """Did the alert reach the OWNER (configured default chat)?
+    """Did the alert reach a fixed recipient (configured TELEGRAM_CHAT_ID)?
 
-    The owner is the gate for recording a newly-opened date as known. When no
-    owner chat is configured the send goes through the dry-run path; treat that
-    as success unless the dry-run itself failed.
+    Delivery to a fixed recipient is the gate for recording a newly-opened date
+    as known. With several fixed recipients, succeeding for at least one is
+    enough to mark the date seen — otherwise one user who blocked the bot would
+    make every cycle re-alert everyone forever. When no fixed recipient is
+    configured the send goes through the dry-run path; treat that as success
+    unless the dry-run itself failed.
     """
-    owner = str(config["telegram_chat_id"]) if config["telegram_chat_id"] else ""
-    if not owner or not config["telegram_bot_token"]:
+    fixed = [str(c) for c in config["telegram_chat_ids"]]
+    if not fixed or not config["telegram_bot_token"]:
         return not result.dry_run_failed
-    return owner not in result.failed
+    return any(chat_id not in result.failed for chat_id in fixed)
 
 
 def cycle() -> dict[str, str]:
@@ -1443,8 +1451,8 @@ def cycle() -> dict[str, str]:
             print(f"[error] Telegram command failed: {error}", file=sys.stderr)
 
         alert_targets = set(subscribed_chats)
-        if config["telegram_chat_id"]:
-            alert_targets.add(str(config["telegram_chat_id"]))
+        for chat_id in config["telegram_chat_ids"]:
+            alert_targets.add(str(chat_id))
 
         if new_dates:
             message = build_alert_message(new_dates, current, config)
