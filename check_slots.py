@@ -680,7 +680,50 @@ def ajax_headers(config: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def new_calendar_session(config: dict[str, Any]) -> Any:
+class CalendarFormParser(HTMLParser):
+    """Collect the input fields of every <form> on the booking page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: list[dict[str, str]] = []
+        self._current: dict[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr_map = {name.lower(): (value or "") for name, value in attrs}
+        if tag == "form":
+            self._current = {}
+            self.forms.append(self._current)
+        elif tag in {"input", "select", "textarea"} and self._current is not None:
+            name = attr_map.get("name")
+            if name and name not in self._current:
+                self._current[name] = attr_map.get("value", "")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "form":
+            self._current = None
+
+
+def extract_calendar_form(page_html: str, event_id: str) -> dict[str, str] | None:
+    """Return the booking page's calendar search form, including its CakePHP token.
+
+    The site is a CakePHP app whose SecurityComponent requires the form's
+    _Token[fields]/_Token[unlocked] to be POSTed verbatim. Without them the AJAX
+    endpoint returns the application-type chooser instead of the calendar grid
+    (which is why a hand-built POST silently saw zero open days).
+    """
+    parser = CalendarFormParser()
+    parser.feed(page_html)
+    for form in parser.forms:
+        if form.get("event") == str(event_id) and form.get("_Token[fields]"):
+            return form
+    for form in parser.forms:
+        if "disp_type" in form and form.get("_Token[fields]"):
+            return form
+    return None
+
+
+def new_calendar_session(config: dict[str, Any]) -> tuple[Any, dict[str, str]]:
     requests = import_requests()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
@@ -690,31 +733,30 @@ def new_calendar_session(config: dict[str, Any]) -> Any:
         response.raise_for_status()
         return response
 
-    with_retries(call, what="calendar GET")
+    response = with_retries(call, what="calendar GET")
     if not session.cookies.get("USERSESSID") or not session.cookies.get("csrfToken"):
         raise RuntimeError("Initial calendar GET did not set required USERSESSID/csrfToken cookies")
-    return session
+    form = extract_calendar_form(response.text, str(config["event_id"]))
+    if not form:
+        raise RuntimeError(
+            "Could not find the calendar form (with CakePHP _Token) on the booking page; "
+            "the embassy site layout may have changed"
+        )
+    return session, form
 
 
 def fetch_calendar_html(
     session: Any,
     config: dict[str, Any],
+    form: dict[str, str],
     target_month: str | None = None,
 ) -> tuple[str, str]:
-    csrf_token = session.cookies.get("csrfToken")
-    if not csrf_token:
-        raise RuntimeError("Missing csrfToken cookie in calendar session")
-
-    data = {
-        "category": str(config["category_id"]),
-        "event": str(config["event_id"]),
-        "plan": str(config["plan_id"]),
-        "disp_type": "month",
-        "_csrfToken": csrf_token,
-        "search": "exec",
-    }
+    # Replay the booking page's own calendar form (including its CakePHP _Token);
+    # only the target month (the form's `date` field) changes between requests.
+    data = dict(form)
+    data["search"] = "exec"
     if target_month:
-        data[str(config["month_param"])] = month_param_value(target_month)
+        data["date"] = month_param_value(target_month)
 
     def call() -> Any:
         response = session.post(AJAX_URL, headers=ajax_headers(config), data=data, timeout=HTTP_TIMEOUT)
@@ -732,62 +774,22 @@ def redacted_cookies(session: Any) -> dict[str, str]:
     return cookies
 
 
-def candidate_month_values(month: str) -> list[str]:
-    year, month_number = month.split("-", maxsplit=1)
-    return [
-        f"{year}{month_number}",
-        f"{year}-{month_number}",
-        f"{year}/{month_number}/01",
-        f"{year}/{month_number}/25",
-        f"{year}-{month_number}-01",
-        f"{year}-{month_number}-25",
-    ]
-
-
-def probe_month_params(session: Any, config: dict[str, Any], current_month: str) -> list[tuple[str, str, str]]:
-    csrf_token = session.cookies.get("csrfToken")
-    if not csrf_token:
-        raise RuntimeError("Missing csrfToken cookie in calendar session")
-
-    next_month = add_months(current_month, 1)
-    advancing: list[tuple[str, str, str]] = []
-    for name in ["ym", "date", "target_date", "month", "targetYm"]:
-        for value in candidate_month_values(next_month):
-            data = {
-                "category": str(config["category_id"]),
-                "_csrfToken": csrf_token,
-                "search": "exec",
-                name: value,
-            }
-            response = session.post(AJAX_URL, headers=ajax_headers(config), data=data, timeout=30)
-            response.raise_for_status()
-            month = parse_month_from_html(extract_html(response.text))
-            marker = "ADVANCES" if month != current_month else "same"
-            print(f"[probe] candidate {name}={value} -> {month} ({marker})", flush=True)
-            if month != current_month:
-                advancing.append((name, value, month))
-    return advancing
-
-
 def run_probe() -> None:
     config = get_config()
-    session = new_calendar_session(config)
+    session, form = new_calendar_session(config)
     print(f"[probe] GET {configured_booking_url(config)}")
     print(f"[probe] cookies={json.dumps(redacted_cookies(session), sort_keys=True)}")
+    print(f"[probe] calendar form fields={sorted(form.keys())}")
 
-    html_doc, raw_response = fetch_calendar_html(session, config)
+    html_doc, raw_response = fetch_calendar_html(session, config, form)
     month = parse_month_from_html(html_doc)
     scan = scan_calendar_html(html_doc)
     print(f"[probe] parsed_month={month} icons={len(scan['items'])}")
-    print("[probe] raw AJAX response follows")
-    print(raw_response)
-
-    advancing = probe_month_params(session, config, month)
-    if advancing:
-        details = ", ".join(f"{name}={value}->{advanced_month}" for name, value, advanced_month in advancing)
-        print(f"[probe] advancing candidates: {details}")
-    else:
-        print("[probe] no candidate advanced the calendar month")
+    for item in scan["items"][:60]:
+        alt = str(item.get("alt") or "")
+        print(f"[probe]   day={item.get('day')} open={is_open(alt)} alt={alt!r}")
+    print("[probe] raw AJAX response (first 1500 chars) follows")
+    print(raw_response[:1500])
 
 
 def log_month(month: str, scan: dict[str, Any], current_open: dict[str, str]) -> None:
@@ -810,19 +812,19 @@ def log_month(month: str, scan: dict[str, Any], current_open: dict[str, str]) ->
 
 def run_once() -> dict[str, str]:
     config = get_config()
-    session = new_calendar_session(config)
+    session, form = new_calendar_session(config)
     current_open: dict[str, str] = {}
     previous_month: str | None = None
     start_month: str | None = None
 
     for index in range(config["months_ahead"] + 1):
         target_month = add_months(start_month, index) if start_month and index > 0 else None
-        html_doc, _raw = fetch_calendar_html(session, config, target_month)
+        html_doc, _raw = fetch_calendar_html(session, config, form, target_month)
         month = parse_month_from_html(html_doc)
         if start_month is None:
             start_month = month
         if previous_month is not None and month == previous_month:
-            print("[warn] month did not advance — MONTH_PARAM wrong", file=sys.stderr)
+            print("[warn] calendar month did not advance — date navigation failed", file=sys.stderr)
             break
 
         scan = scan_calendar_html(html_doc)
