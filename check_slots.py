@@ -126,6 +126,59 @@ def is_open(alt: str | None) -> bool:
     return False
 
 
+# The status-icon FILENAME is the authoritative availability signal on this site.
+# The <img alt> text is INVERTED relative to reality and must never be trusted on
+# its own: an OPEN day renders icon_circle.svg yet carries alt
+# "Not available / Qabul tugadi / Приём окончен", while a CLOSED day renders
+# icon_disabled.svg yet carries alt "Available / Qabul qilinmoqda / Приём ведётся".
+# Verified against a real open slot captured live on 2026-06-30.
+OPEN_ICON_MARKERS = ("icon_circle", "icon_triangle")  # ○ available, △ few remaining
+CLOSED_ICON_MARKERS = ("icon_disabled", "icon_cross", "icon_batsu")  # greyed / × full
+ICON_STATUS_LABELS = {
+    "icon_circle": "Available",
+    "icon_triangle": "Few remaining",
+}
+
+
+def icon_is_open(src: str | None) -> bool | None:
+    """Classify a day from its status-icon filename.
+
+    Returns True (open), False (closed), or None when the icon is unrecognized.
+    """
+    name = (src or "").lower()
+    if any(marker in name for marker in OPEN_ICON_MARKERS):
+        return True
+    if any(marker in name for marker in CLOSED_ICON_MARKERS):
+        return False
+    return None
+
+
+def icon_status_label(src: str | None, fallback: str = "Available") -> str:
+    """Human-readable status for an open day (the raw alt text is inverted)."""
+    name = (src or "").lower()
+    for marker, label in ICON_STATUS_LABELS.items():
+        if marker in name:
+            return label
+    return fallback
+
+
+def slot_is_open(src: str | None, alt: str | None) -> bool:
+    """Decide whether a calendar day is open, preferring the icon over alt text."""
+    verdict = icon_is_open(src)
+    if verdict is not None:
+        return verdict
+    # Unknown icon: the alt text on this site is inverted/unreliable, so we cannot
+    # safely treat it as open. Warn (so future icon changes surface) and fail closed.
+    if (src or "").strip():
+        print(
+            f"[warn] Unrecognized slot icon (treating as closed): src={src!r} alt={alt!r}",
+            file=sys.stderr,
+        )
+        return False
+    # No icon src at all (legacy/synthetic markup): last-resort alt heuristic.
+    return is_open(alt)
+
+
 def parse_year_month(text: str) -> str:
     match = re.search(r"(\d{4})\s*年\s*0?(\d{1,2})\s*月", text)
     if not match:
@@ -583,14 +636,17 @@ class CalendarCellParser(HTMLParser):
         tag = tag.lower()
         attr_map = {name.lower(): value for name, value in attrs}
         if tag in {"td", "li"}:
-            self.cells.append({"parts": [], "alts": []})
+            self.cells.append({"parts": [], "alts": [], "srcs": []})
             self.stack.append((tag, len(self.cells) - 1))
             return
         if tag == "img" and self.stack:
             alt = attr_map.get("alt")
-            src = attr_map.get("src") or ""
-            if alt and "icon_disabled" not in src:
-                self.cells[self.stack[-1][1]]["alts"].append(alt)
+            if alt:
+                cell = self.cells[self.stack[-1][1]]
+                cell["alts"].append(alt)
+                # The icon filename is the authoritative status signal; keep it
+                # alongside the (unreliable) alt text so callers can prefer it.
+                cell["srcs"].append(attr_map.get("src") or "")
 
     def handle_data(self, data: str) -> None:
         if self.stack:
@@ -655,8 +711,10 @@ def scan_calendar_html(html_doc: str) -> dict[str, Any]:
         text = collapse_ws(" ".join(cell["parts"]))
         day_match = re.search(r"\b(\d{1,2})\b", text)
         day = day_match.group(1) if day_match else None
-        for alt in cell["alts"]:
-            items.append({"day": day, "alt": alt})
+        srcs = cell.get("srcs") or []
+        for index, alt in enumerate(cell["alts"]):
+            src = srcs[index] if index < len(srcs) else ""
+            items.append({"day": day, "alt": alt, "src": src})
     return {"text": html_to_text(html_doc), "items": items}
 
 
@@ -727,7 +785,7 @@ def extract_calendar_form(page_html: str, event_id: str) -> dict[str, str] | Non
     return None
 
 
-def new_calendar_session(config: dict[str, Any]) -> tuple[Any, dict[str, str]]:
+def new_calendar_session(config: dict[str, Any]) -> tuple[Any, dict[str, str], str]:
     requests = import_requests()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
@@ -746,7 +804,7 @@ def new_calendar_session(config: dict[str, Any]) -> tuple[Any, dict[str, str]]:
             "Could not find the calendar form (with CakePHP _Token) on the booking page; "
             "the embassy site layout may have changed"
         )
-    return session, form
+    return session, form, response.text
 
 
 def fetch_calendar_html(
@@ -780,10 +838,17 @@ def redacted_cookies(session: Any) -> dict[str, str]:
 
 def run_probe() -> None:
     config = get_config()
-    session, form = new_calendar_session(config)
+    session, form, page_html = new_calendar_session(config)
     print(f"[probe] GET {configured_booking_url(config)}")
     print(f"[probe] cookies={json.dumps(redacted_cookies(session), sort_keys=True)}")
     print(f"[probe] calendar form fields={sorted(form.keys())}")
+    page_scan = scan_calendar_html(page_html)
+    print(f"[probe] initial GET icons={len(page_scan['items'])}")
+    for item in page_scan["items"][:20]:
+        alt = str(item.get("alt") or "")
+        src = str(item.get("src") or "")
+        icon = src.rsplit("/", 1)[-1]
+        print(f"[probe]   GET day={item.get('day')} open={slot_is_open(src, alt)} icon={icon!r} alt={alt!r}")
 
     html_doc, raw_response = fetch_calendar_html(session, config, form)
     month = parse_month_from_html(html_doc)
@@ -791,7 +856,9 @@ def run_probe() -> None:
     print(f"[probe] parsed_month={month} icons={len(scan['items'])}")
     for item in scan["items"][:60]:
         alt = str(item.get("alt") or "")
-        print(f"[probe]   day={item.get('day')} open={is_open(alt)} alt={alt!r}")
+        src = str(item.get("src") or "")
+        icon = src.rsplit("/", 1)[-1]
+        print(f"[probe]   day={item.get('day')} open={slot_is_open(src, alt)} icon={icon!r} alt={alt!r}")
     print("[probe] raw AJAX response (first 1500 chars) follows")
     print(raw_response[:1500])
 
@@ -803,11 +870,13 @@ def log_month(month: str, scan: dict[str, Any], current_open: dict[str, str]) ->
         icon_count += 1
         day = item.get("day")
         alt = item.get("alt") or ""
-        if not day or not is_open(str(alt)):
+        src = item.get("src") or ""
+        if not day or not slot_is_open(str(src), str(alt)):
             continue
         date_key = f"{month}-{int(str(day)):02d}"
         open_dates.append(date_key)
-        current_open[date_key] = str(alt)
+        # Store a corrected, human-readable status (the raw alt text is inverted).
+        current_open[date_key] = icon_status_label(str(src), fallback=str(alt))
 
     unique_open = sorted(set(open_dates))
     open_log = ",".join(unique_open) if unique_open else "none"
@@ -816,17 +885,21 @@ def log_month(month: str, scan: dict[str, Any], current_open: dict[str, str]) ->
 
 def run_once() -> dict[str, str]:
     config = get_config()
-    session, form = new_calendar_session(config)
+    session, form, page_html = new_calendar_session(config)
     current_open: dict[str, str] = {}
     previous_month: str | None = None
     start_month: str | None = None
 
-    for index in range(config["months_ahead"] + 1):
-        target_month = add_months(start_month, index) if start_month and index > 0 else None
+    initial_month = parse_month_from_html(page_html)
+    initial_scan = scan_calendar_html(page_html)
+    log_month(initial_month, initial_scan, current_open)
+    start_month = initial_month
+    previous_month = initial_month
+
+    for index in range(1, config["months_ahead"] + 1):
+        target_month = add_months(start_month, index) if start_month else None
         html_doc, _raw = fetch_calendar_html(session, config, form, target_month)
         month = parse_month_from_html(html_doc)
-        if start_month is None:
-            start_month = month
         if previous_month is not None and month == previous_month:
             print("[warn] calendar month did not advance — date navigation failed", file=sys.stderr)
             break

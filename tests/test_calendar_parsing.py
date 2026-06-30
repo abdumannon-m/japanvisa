@@ -1,9 +1,12 @@
 """Regression tests for the embassy calendar request + grid parsing.
 
 These lock the contract that broke silently in production: the booking site
-(a CakePHP app) renders the calendar grid with <img alt="..."> status icons and
-ships a per-form security token. The scraper must (a) pick the calendar form
-with its _Token, and (b) read day availability from the img alt text.
+(a CakePHP app) renders the calendar grid with status icons and ships a per-form
+security token. The scraper must (a) pick the calendar form with its _Token, and
+(b) read day availability from the icon FILENAME (icon_circle.svg = open), NOT
+from the <img alt> text, which this site serves INVERTED (an open day's circle
+icon carries alt "Not available / Qabul tugadi"; a disabled day carries alt
+"Available / Qabul qilinmoqda"). Verified against a live open slot 2026-06-30.
 """
 
 import json
@@ -31,11 +34,11 @@ BOOKING_PAGE = """
 """
 
 
-def _grid_cell(day, alt):
+def _grid_cell(day, alt, icon="icon_circle.svg"):
     return (
         '<td><div class="sc_cal_month_itemlist">'
         f'<div class="sc_cal_date"><a href="#" class="js_change_date" data-date="2026/07/0{day}">{day}</a></div>'
-        f'<a href="#" class="c_cal_time_cell"><img src="/assets/images/user/icon_circle.svg" '
+        f'<a href="#" class="c_cal_time_cell"><img src="/assets/images/user/{icon}" '
         f'alt="{alt}" data-date="2026/07/0{day}"/></a>'
         '</div></td>'
     )
@@ -55,21 +58,30 @@ def test_extract_calendar_form_missing_returns_none():
     assert c.extract_calendar_form("<html><body>no forms</body></html>", "20") is None
 
 
-def test_is_open_recognizes_embassy_statuses():
-    # The real "closed" wording the site serves for full/expired days.
-    assert c.is_open(" Not available / Qabul tugadi / Приём окончен") is False
-    # Positive wordings that must trigger an alert.
-    assert c.is_open("Qabul qilinmoqda") is True
-    assert c.is_open("受付中") is True
-    assert c.is_open("残りわずか") is True
+def test_slot_is_open_trusts_icon_over_inverted_alt_text():
+    base = "/assets/images/user/"
+    # Circle icon = OPEN, even though its alt text lies and says "Not available".
+    assert c.slot_is_open(base + "icon_circle.svg?1", " Not available / Qabul tugadi") is True
+    # Disabled icon = CLOSED, even though its alt text lies and says "Available".
+    assert c.slot_is_open(base + "icon_disabled.svg?1", " Available / Qabul qilinmoqda") is False
+    # Triangle = few remaining = OPEN.
+    assert c.slot_is_open(base + "icon_triangle.svg", "anything") is True
+    # An unrecognized icon fails closed: the alt text is never trusted on its own.
+    assert c.slot_is_open(base + "icon_mystery.svg", "Qabul qilinmoqda") is False
+    # icon_is_open reports the raw verdict, or None when unrecognized.
+    assert c.icon_is_open("icon_circle.svg") is True
+    assert c.icon_is_open("icon_disabled.svg") is False
+    assert c.icon_is_open("icon_mystery.svg") is None
 
 
 def test_scan_reads_grid_from_json_response_and_flags_open():
     # The AJAX endpoint returns {"html": "<grid>"}; extract_html must unwrap it.
     grid = (
         "<table><tr>"
-        + _grid_cell(1, " Not available / Qabul tugadi / Приём окончен")
-        + _grid_cell(2, "Qabul qilinmoqda")
+        # Day 1 is CLOSED: disabled icon (its alt lies and says "Qabul qilinmoqda").
+        + _grid_cell(1, " Available / Qabul qilinmoqda / Приём ведётся", icon="icon_disabled.svg")
+        # Day 2 is OPEN: circle icon (its alt lies and says "Not available").
+        + _grid_cell(2, " Not available / Qabul tugadi / Приём окончен", icon="icon_circle.svg")
         + "</tr></table>"
     )
     response_text = json.dumps({"html": grid})
@@ -80,6 +92,37 @@ def test_scan_reads_grid_from_json_response_and_flags_open():
 
     current_open: dict[str, str] = {}
     c.log_month("2026-07", scan, current_open)
-    # Only the day with a positive status is recorded as open.
+    # Only the day whose ICON says open is recorded, regardless of alt text.
     assert "2026-07-02" in current_open
     assert "2026-07-01" not in current_open
+
+
+def test_icon_filename_is_authoritative_not_alt_text():
+    # GROUND TRUTH captured live on 2026-06-30: the embassy's <img alt> text is
+    # INVERTED relative to availability. An OPEN day renders icon_circle.svg but
+    # carries alt "Not available / Qabul tugadi / Приём окончен"; a CLOSED day
+    # renders icon_disabled.svg but carries alt "Available / Qabul qilinmoqda".
+    # Detection MUST key off the icon filename, never the alt text.
+    open_cell = (
+        '<td><div class="sc_cal_month_itemlist">'
+        '<div class="sc_cal_date">3</div>'
+        '<a class="c_cal_time_cell"><img src="/assets/images/user/icon_circle.svg?1604042662" '
+        'alt=" Not available / Qabul tugadi / Приём окончен" '
+        'data-date="2026/07/03" data-value="day" data-target="sel_disp_type"/></a>'
+        '</div></td>'
+    )
+    closed_cell = (
+        '<td><div class="sc_cal_month_itemlist">'
+        '<div class="sc_cal_date">6</div>'
+        '<p class="c_cal_time_cell"><img src="/assets/images/user/icon_disabled.svg?1604042663" '
+        'alt=" Available / Qabul qilinmoqda / Приём ведётся" width="24" height="24"/></p>'
+        '</div></td>'
+    )
+    grid = "<table><tr>" + open_cell + closed_cell + "</tr></table>"
+    scan = c.scan_calendar_html(grid)
+    current_open: dict[str, str] = {}
+    c.log_month("2026-07", scan, current_open)
+    # The circle day is OPEN despite its "Not available" alt; the disabled day is
+    # CLOSED despite its "Available" alt.
+    assert "2026-07-03" in current_open
+    assert "2026-07-06" not in current_open
